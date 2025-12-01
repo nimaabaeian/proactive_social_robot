@@ -25,7 +25,7 @@ class EmbodiedBehaviour(yarp.RFModule):
     
     THRESH_MEAN = 0.5
     THRESH_VAR = 0.1
-    WAIT_AFTER_ACTION = 3.0
+    WAIT_AFTER_ACTION = 3.5
     COOLDOWN = 2.0
     SELFADAPTOR_PERIOD_CALM = 240.0
     SELFADAPTOR_PERIOD_LIVELY = 120.0
@@ -262,14 +262,6 @@ class EmbodiedBehaviour(yarp.RFModule):
             cmd_bottle.addString(command)
             
             self.port_rpc.write(cmd_bottle, reply_bottle)
-            
-            # Check if reply indicates success
-            if reply_bottle.size() > 0:
-                response = reply_bottle.toString()
-                if "nack" in response.lower() or "error" in response.lower():
-                    print(f"[Always-On] ✗ Command '{command}' failed: {response}")
-                    return False
-                return True
             return True
         except Exception as e:
             print(f"[Always-On] ✗ Error executing '{command}': {e}")
@@ -509,14 +501,7 @@ class EmbodiedBehaviour(yarp.RFModule):
                         cmd_bottle.addString(action)
                         
                         self.port_rpc.write(cmd_bottle, reply_bottle)
-                        
-                        if reply_bottle.size() > 0:
-                            response = reply_bottle.toString()
-                            if "nack" in response.lower() or "error" in response.lower():
-                                print(f"[Proactive] ✗ RPC failed: {response}")
-                                continue
-                        
-                        print(f"[Proactive] ✓ Action executed")
+                        print(f"[Proactive] ✓ Action sent")
                     except Exception as e:
                         print(f"[Proactive] ✗ Error: {e}")
                         continue
@@ -524,13 +509,8 @@ class EmbodiedBehaviour(yarp.RFModule):
                     # Wait for: action completion + human reaction + rolling window to refresh with new data
                     # This ensures post-state measurement doesn't contain pre-action data
                     print(f"[Proactive] ⏳ Waiting {self.WAIT_AFTER_ACTION}s for action + reaction + sensor integration...")
-                    wait_steps = int(self.WAIT_AFTER_ACTION / 0.1)
-                    for _ in range(wait_steps):
-                        time.sleep(0.1)
-                        # Early exit if user left
-                        if self.num_faces == 0:
-                            print(f"[Proactive] ⚠ User left during wait, aborting measurement")
-                            break
+                    time.sleep(self.WAIT_AFTER_ACTION)
+                    print(f"[Proactive] ✓ Wait completed")
                     
                     # Get windowed post-state snapshot (instant, uses rolling buffer)
                     print(f"[Proactive] 📊 Capturing post-state (instant from rolling window)...")
@@ -644,14 +624,7 @@ class EmbodiedBehaviour(yarp.RFModule):
                         cmd_bottle.addString(action)
                         
                         self.port_rpc.write(cmd_bottle, reply_bottle)
-                        
-                        if reply_bottle.size() > 0:
-                            response = reply_bottle.toString()
-                            if "nack" in response.lower() or "error" in response.lower():
-                                print(f"[Self-Adaptor] ✗ Failed: {response}")
-                                continue
-                        
-                        print(f"[Self-Adaptor] ✓ Executed")
+                        print(f"[Self-Adaptor] ✓ Action sent")
                     except Exception as e:
                         print(f"[Self-Adaptor] ✗ Error: {e}")
                         continue
