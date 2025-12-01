@@ -34,11 +34,12 @@ This system implements a **developmental reinforcement learning architecture** f
 
 ### Performance Optimizations
 
-**1. Rolling Window Buffers (Non-Blocking)**
+**1. Rolling Window Buffers (Non-Blocking, Thread-Safe)**
 - IIE Monitor continuously populates a 60-sample rolling buffer at 20Hz
 - State snapshots read instantly from buffer (0.0s vs 3.0s blocking)
 - Maintains 3-second noise filtering without wait time
 - Pre/post state capture: **6.0s → 0.0s** (instant)
+- Thread-safe: `_state_lock` protects deque from concurrent append/iteration race conditions
 
 **2. Native YARP RPC (Fire-and-Forget)**
 - Uses native `yarp.RpcClient` for action execution
@@ -57,8 +58,8 @@ This system implements a **developmental reinforcement learning architecture** f
 
 **4. Optimized Timing**
 - `WAIT_AFTER_ACTION`: **3.5s** (ensures rolling window fully refreshes with post-action data)
-- `COOLDOWN`: 5.0s → **2.0s** (60% faster)
-- Total cycle time: ~14s → **~6s** (57% faster)
+- `COOLDOWN`: **5.0s** (minimum time between proactive actions)
+- Total cycle time: ~9s per action (3.5s wait + 5.0s cooldown + decision overhead)
 
 **Why 3.5s Wait?**
 - Action execution time: ~0.5s
@@ -294,10 +295,10 @@ PROACTIVE_ACTIONS = [
 
 12. Decay epsilon: ε = max(0.2, ε × 0.957603)
 
-13. Cooldown 2 seconds
+13. Cooldown 5 seconds
 ```
 
-**Rolling Window Snapshot** (Non-Blocking Noise Filtering):
+**Rolling Window Snapshot** (Non-Blocking, Thread-Safe Noise Filtering):
 ```python
 def _windowed_snapshot():
     """Average state from rolling buffer (instant, 0.0s)"""
@@ -306,12 +307,16 @@ def _windowed_snapshot():
     
     current = _get_state_snapshot()
     
-    if len(iie_window) < 5:
+    # Thread-safe copy (prevents race condition with IIE Monitor)
+    with _state_lock:
+        window_copy = list(iie_window)
+    
+    if len(window_copy) < 5:
         return current  # Not enough data yet
     
-    # Instant averaging of buffered data
-    iie_means = [s['mean'] for s in iie_window]
-    iie_vars = [s['var'] for s in iie_window]
+    # Instant averaging of buffered data (safe to iterate)
+    iie_means = [s['mean'] for s in window_copy]
+    iie_vars = [s['var'] for s in window_copy]
     
     return {
         'IIE_mean': mean(iie_means),    # 3s average (60 samples)
@@ -693,7 +698,7 @@ THRESH_VAR = 0.1      # Maximum variance to act
 **Timing**:
 ```python
 WAIT_AFTER_ACTION = 3.5          # Seconds for action + reaction + rolling window refresh
-COOLDOWN = 2.0                   # Seconds between actions
+COOLDOWN = 5.0                   # Seconds between actions
 SELFADAPTOR_PERIOD_CALM = 240.0  # Self-adaptor: calm (4 min)
 SELFADAPTOR_PERIOD_LIVELY = 120.0  # Self-adaptor: lively (2 min)
 NO_FACES_TIMEOUT = 120.0         # Always-on: stop after (2 min)

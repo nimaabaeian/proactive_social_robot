@@ -256,13 +256,17 @@ class EmbodiedBehaviour(yarp.RFModule):
         # Get current instantaneous state for non-IIE fields
         current = self._get_state_snapshot()
         
+        # Create thread-safe copy of rolling window
+        with self._state_lock:
+            window_copy = list(self.iie_window)
+        
         # If window is empty or too small, return current state
-        if len(self.iie_window) < 5:
+        if len(window_copy) < 5:
             return current
         
-        # Average IIE values from rolling window
-        iie_means = [sample['mean'] for sample in self.iie_window]
-        iie_vars = [sample['var'] for sample in self.iie_window]
+        # Average IIE values from rolling window copy (safe to iterate)
+        iie_means = [sample['mean'] for sample in window_copy]
+        iie_vars = [sample['var'] for sample in window_copy]
         
         return {
             'IIE_mean': sum(iie_means) / len(iie_means),
@@ -324,11 +328,12 @@ class EmbodiedBehaviour(yarp.RFModule):
                         best = max(face_data, key=lambda x: x['mean'])
                         old_mean = self.IIE_mean
                         
-                        # Update instantaneous state
-                        self._update_iie(best['mean'], best['variance'])
-                        
-                        # Append to rolling window for averaging
-                        self.iie_window.append({'mean': best['mean'], 'var': best['variance']})
+                        # Update instantaneous state AND rolling window atomically
+                        with self._state_lock:
+                            self.IIE_mean = best['mean']
+                            self.IIE_var = best['variance']
+                            self.last_iie_update = time.time()
+                            self.iie_window.append({'mean': best['mean'], 'var': best['variance']})
                         
                         if abs(best['mean'] - old_mean) > 0.1:
                             print(f"[IIE] {old_mean:.2f}→{best['mean']:.2f}")
