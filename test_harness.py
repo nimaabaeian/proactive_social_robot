@@ -26,6 +26,7 @@ WINDOWING BEHAVIOR (Blocking On-Demand Collection):
     - Post-state: 3.0s blocking window (_windowed_snapshot samples @ 0.1s steps)
     - Cooldown: 5.0s between actions
     - Total cycle: ~14s per action (3s+3s+3s+5s)
+    - Self-adaptor: 60-120s random period (1-2 minutes)
     
     Note: Unlike previous rolling buffer architecture, snapshots are collected
     on-demand by blocking for duration rather than reading from pre-filled deque.

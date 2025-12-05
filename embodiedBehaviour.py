@@ -28,8 +28,6 @@ class EmbodiedBehaviour(yarp.RFModule):
     THRESH_MEAN = 0.5
     THRESH_VAR = 0.1
     WAIT_AFTER_ACTION = 3.0
-    SELFADAPTOR_PERIOD_CALM = 240.0
-    SELFADAPTOR_PERIOD_LIVELY = 120.0
     
     EPSILON = 0.8
     EPSILON_MIN = 0.2
@@ -608,8 +606,8 @@ class EmbodiedBehaviour(yarp.RFModule):
             
             while self.running:
                 try:
-                    # Random period between 120-240 seconds
-                    period = random.uniform(120.0, 240.0)
+                    # Random period between 60-120 seconds
+                    period = random.uniform(60.0, 120.0)
                     print(f"[Actor/SA] ⏱️ Waiting {period:.1f}s until next self-adaptor...")
                     
                     # Interruptible sleep with proactive priority
@@ -623,7 +621,7 @@ class EmbodiedBehaviour(yarp.RFModule):
                             while self.running and self._is_proactive_executing():
                                 time.sleep(0.5)
                             # Restart period after proactive completes
-                            new_period = random.uniform(120.0, 240.0)
+                            new_period = random.uniform(60.0, 120.0)
                             print(f"[Actor/SA] 🔄 Proactive done, restarting with new period: {new_period:.1f}s")
                             period = new_period
                             elapsed = 0.0

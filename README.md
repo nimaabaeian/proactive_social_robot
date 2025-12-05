@@ -24,6 +24,46 @@ This system implements a **developmental reinforcement learning architecture** f
   - **Embodied Behaviour** (Actor): Perceives, decides, and acts
   - **Learning** (Critic): Evaluates actions and improves decision-making
 
+### Module Summary
+
+#### Embodied Behaviour (Actor)
+**Purpose**: Perceive environment, make decisions, execute actions
+
+**6 Threads**:
+1. **IIE Monitor**: Tracks interaction intention (mean, variance) from face analysis
+2. **Context Monitor**: Tracks environment classification (calm=0, lively=1)
+3. **Info Monitor**: Tracks face count and mutual gaze
+4. **Always-On Monitor**: Auto-stops system after 120s with no faces, restarts when faces return
+5. **Proactive Thread**: Learning-driven actions with threshold checks (IIE≥0.5, var<0.1, gaze>0)
+   - Uses epsilon-greedy selection from Q-table
+   - Collects pre/post state with 3s blocking snapshots
+   - Sends 13-field experience to Learning module
+6. **Self-Adaptor Thread**: Random background behaviors (yawn, look around, cough)
+   - Random 60-120s periods
+   - Yields to proactive actions (priority system)
+   - Only executes when always-on is active
+
+**Key Mechanism**: Blocking windowed snapshots collect 30 samples over 3s at 0.1s intervals for noise-robust state measurement
+
+#### Learning (Critic)
+**Purpose**: Evaluate actions and improve policy
+
+**2 Learning Systems**:
+1. **Q-Learning**: TD(0) updates with multi-component reward
+   - Structure: Q[context][action] → value
+   - Reward = W_delta×(IIE_change) + W_var×(var_reduction) + W_level×(threshold_margin) - action_cost
+   - Updates: α=0.3, γ=0.92, clipped to [-1,1]
+   - Saves JSON Q-table after every experience
+
+2. **Gatekeeper (Scene Discriminator)**: GradientBoostingClassifier
+   - Learns from raw outcomes: label = 1 if (post_IIE - pre_IIE) > 0.02 else 0
+   - Input: 6D pre-state features [pre_IIE_mean, pre_IIE_var, pre_ctx, pre_faces, pre_gaze, time_delta]
+   - Output: Binary (YES/NO) - should act in this scene?
+   - Buffer size: 4 samples, grows from 100→200 trees
+   - Currently disabled in embodiedBehaviour.py (Phase 3 feature)
+
+**Key Distinction**: Q-learning uses weighted reward function; gatekeeper learns from physical reality (simple post-pre comparison)
+
 ### Key Features
 - **Real-time learning**: Updates after every interaction
 - **Context-aware**: Adapts behavior to calm vs. lively environments
@@ -50,7 +90,7 @@ This system implements a **developmental reinforcement learning architecture** f
 
 **3. Self-Adaptor Priority System**
 - Self-adaptors execute only when always-on is active
-- Random period between 120-240 seconds per cycle
+- Random period between 60-120 seconds per cycle (1-2 minutes)
 - Proactive actions have priority: self-adaptor aborts cycle if proactive starts
 - Aborts only after proactive passes threshold checks and selects action
 - Restarts with new random period after proactive completes
@@ -269,8 +309,8 @@ The system provides **real-time visual feedback** through a clean, intuitive con
 │         │                                                         │
 │         ▼                                                         │
 │  ┌─────────────┐         ┌──────────────┐                       │
-│  │ 3. TRAIN ML │────────▶│ Buffer (10x) │                       │
-│  │   MODELS    │         │ IIE + CTX    │                       │
+│  │ 3. TRAIN ML │────────▶│ Buffer (4x)  │                       │
+│  │   MODELS    │         │ Gatekeeper   │                       │
 │  └─────────────┘         └──────────────┘                       │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -396,8 +436,9 @@ PROACTIVE_ACTIONS = [
 1. Check if always-on is active
    → Skip cycle if stopped
 
-2. Capture pre-state snapshot (instant from rolling window)
-   → Uses 3 seconds of buffered data (60 samples at 20Hz)
+2. Capture pre-state snapshot (blocking 3s window)
+   → Collects 30 samples over 3.0 seconds at 0.1s intervals
+   → Averages to reduce noise
 
 3. Check presence conditions:
    ✓ num_faces > 0
@@ -415,49 +456,72 @@ PROACTIVE_ACTIONS = [
    • 20% of time: Explore random action
    • Epsilon decays: 0.8 → 0.2 over time
 
-7. Execute action via native YARP RPC:
-   yarp.Bottle → /interactionInterface (fire-and-forget)
+7. Set proactive_active flag (signals self-adaptor to abort)
 
-8. Wait 3.5 seconds for action + reaction + sensor integration
-   → Fixed wait ensures complete rolling window refresh
+8. Execute action via subprocess RPC:
+   subprocess.run('echo "exe {action}" | yarp rpc /interactionInterface')
+   → 5-second timeout, fire-and-forget pattern
 
-9. Capture post-state snapshot (instant from rolling window)
+9. Wait 3.0 seconds for action + reaction
+   → Wait allows action execution + human reaction to manifest
 
-10. Send experience to Learning module (13 fields)
+10. Capture post-state snapshot (blocking 3s window)
+    → Collects 30 samples over 3.0 seconds at 0.1s intervals
+    → Averages to measure outcome
 
-11. Log to CSV
+11. Send experience to Learning module (13 fields)
 
-12. Decay epsilon: ε = max(0.2, ε × 0.957603)
+12. Log to CSV
 
-13. Cooldown 5 seconds
+13. Decay epsilon: ε = max(0.2, ε × 0.957603)
+
+14. Clear proactive_active flag
+
+15. Cooldown 5 seconds
 ```
 
-**Rolling Window Snapshot** (Non-Blocking, Thread-Safe Noise Filtering):
+**Blocking Windowed Snapshot** (On-Demand Collection with Averaging):
 ```python
-def _windowed_snapshot():
-    """Average state from rolling buffer (instant, 0.0s)"""
-    # IIE Monitor continuously fills iie_window at 20Hz
-    # Window holds last 60 samples (3 seconds of history)
+def _windowed_snapshot(duration=3.0, step=0.1):
+    """Collect and average state over time window (blocking)
     
-    current = _get_state_snapshot()
+    Args:
+        duration: Time window in seconds (default 3.0)
+        step: Sampling interval in seconds (default 0.1)
+        
+    Returns:
+        dict: Averaged state over ~30 samples
+    """
+    samples = []
+    t0 = time.time()
     
-    # Thread-safe copy (prevents race condition with IIE Monitor)
-    with _state_lock:
-        window_copy = list(iie_window)
+    # Collect samples over duration
+    while time.time() - t0 < duration and self.running:
+        samples.append(self._get_state_snapshot())
+        time.sleep(step)
     
-    if len(window_copy) < 5:
-        return current  # Not enough data yet
+    # Fallback to single snapshot if no samples
+    if not samples:
+        return self._get_state_snapshot()
     
-    # Instant averaging of buffered data (safe to iterate)
-    iie_means = [s['mean'] for s in window_copy]
-    iie_vars = [s['var'] for s in window_copy]
+    # Average numeric fields
+    avg_mean = sum(s['IIE_mean'] for s in samples) / len(samples)
+    avg_var = sum(s['IIE_var'] for s in samples) / len(samples)
+    
+    # Mode for categorical (most common context)
+    ctx_mode = max(set(s['ctx'] for s in samples), 
+                   key=[s['ctx'] for s in samples].count)
+    
+    # Round counts to nearest integer
+    avg_faces = round(sum(s['num_faces'] for s in samples) / len(samples))
+    avg_gaze = round(sum(s['num_mutual_gaze'] for s in samples) / len(samples))
     
     return {
-        'IIE_mean': mean(iie_means),    # 3s average (60 samples)
-        'IIE_var': mean(iie_vars),      # 3s average (60 samples)
-        'ctx': current['ctx'],          # Current
-        'num_faces': current['num_faces'],
-        'num_mutual_gaze': current['num_mutual_gaze']
+        'IIE_mean': avg_mean,
+        'IIE_var': avg_var,
+        'ctx': ctx_mode,
+        'num_faces': avg_faces,
+        'num_mutual_gaze': avg_gaze
     }
 ```
 
@@ -502,7 +566,7 @@ SELF_ADAPTORS = [
 ```
 
 **Behavior**:
-- **Random timing**: Each cycle uses random period between 120-240 seconds
+- **Random timing**: Each cycle uses random period between 60-120 seconds (1-2 minutes)
 - **Always-on dependent**: Only executes when always-on is active
 - **Proactive priority**: Aborts cycle if proactive action starts executing
   - Monitors proactive execution during sleep period
@@ -518,7 +582,7 @@ SELF_ADAPTORS = [
 - ✗ No experience sent to Learning
 - ✓ Respects always-on state (only when active)
 - ✓ Yields to proactive actions (priority system)
-- ✓ Random timing (120-240s per cycle)
+- ✓ Random timing (60-120s per cycle)
 
 ---
 
@@ -744,7 +808,7 @@ else:
 ```
 
 **Training**:
-- Buffer size: 10 samples
+- Buffer size: 4 samples
 - When buffer full: train on batch
 - Incremental: adds 5 trees per training
 - Max trees: 200
@@ -874,6 +938,46 @@ bottle.addInt32(post_num_mutual_gaze)     # 12: Gaze after
 
 ---
 
+## Implementation Notes
+
+### Current State (Active Features)
+
+**Embodied Behaviour Module**:
+- ✅ 6-thread architecture fully operational
+- ✅ Blocking windowed snapshots (3s duration, 0.1s steps)
+- ✅ Subprocess-based RPC execution
+- ✅ Self-adaptor priority system (60-120s random periods)
+- ✅ Always-on auto-stop/start mechanism
+- ✅ Proactive actions with Q-learning
+- ✅ Thread-safe state management
+
+**Learning Module**:
+- ✅ Q-learning with TD(0) updates
+- ✅ Multi-component reward function
+- ✅ Gatekeeper model training (buffer size: 4)
+- ✅ JSON Q-table persistence
+- ✅ PKL model persistence
+- ✅ CSV logging for both Q-learning and gatekeeper
+
+### Phase 3 Feature (Disabled)
+
+**Gatekeeper Integration in embodiedBehaviour.py**:
+- Status: **Commented out** (lines ~461-487)
+- Reason: Requires 200+ training samples before activation
+- Location: Proactive thread, after threshold checks
+- Activation steps:
+  1. Uncomment gatekeeper check block
+  2. Uncomment `_check_gatekeeper()` method
+  3. Uncomment `self.last_action_time` tracking in `__init__`
+  4. Add `import pickle, numpy` at top
+
+**When to activate**:
+- After collecting 200+ experiences (50 full buffer cycles)
+- When `gate_classifier.pkl` file exists and is trained
+- To add scene discrimination layer before action execution
+
+---
+
 ## Configuration & Parameters
 
 ### Embodied Behaviour
@@ -889,7 +993,7 @@ THRESH_VAR = 0.1      # Maximum variance to act
 WAIT_AFTER_ACTION = 3.0          # Seconds for action execution + human reaction
 COOLDOWN = 5.0                   # Seconds between proactive actions (hardcoded)
 NO_FACES_TIMEOUT = 120.0         # Always-on: stop after (2 min)
-# Self-adaptor: random period between 120-240s per cycle
+# Self-adaptor: random period between 60-120s per cycle (1-2 minutes)
 # (Context-dependent timing removed in favor of random periods)
 ```
 
@@ -941,7 +1045,7 @@ VAR_EPS = 0.02    # Minimum variance change (±0.02)
 
 **Gatekeeper Model**:
 ```python
-BUFFER_SIZE = 10                # Training batch size
+BUFFER_SIZE = 4                 # Training batch size
 GATE_MAX_DEPTH = 3              # Tree depth
 GATE_N_ESTIMATORS = 100         # Initial trees
 GATE_MAX_ESTIMATORS = 200       # Maximum trees
@@ -1076,8 +1180,8 @@ if post_IIE_mean < 0.5:
 
 **Scenario 1: Maintain engagement**
 ```python
-Pre:  IIE = 0.65, var = 0.08  # From 3s rolling buffer average
-Post: IIE = 0.67, var = 0.06  # From 3s rolling buffer average
+Pre:  IIE = 0.65, var = 0.08  # From 3s windowed snapshot average
+Post: IIE = 0.67, var = 0.06  # From 3s windowed snapshot average
 Action: ao_greet
 
 delta_mean = 0.02 → 0.0 (dead zone)
@@ -1383,7 +1487,7 @@ def _check_gatekeeper(self, pre, time_delta):
 4. **Independent Validation**: Can compare gatekeeper decisions to Q-learning to spot issues
 
 ### Training Requirements (Before Integration)
-- **Minimum samples**: 200 experiences (buffer fills 20 times)
+- **Minimum samples**: 200 experiences (buffer fills 50 times)
 - **Phase**: Episode 100+ (Phase 3 convergence)
 - **Gatekeeper convergence**: Clear YES/NO scene clustering visible in `gate_training_log.csv`
 - **Label balance**: Stabilized around 60% YES, 40% NO

@@ -33,7 +33,7 @@ class Learning(yarp.RFModule):
     DELTA_EPS = 0.05  # Dead zone: minimum IIE change to be considered meaningful
     VAR_EPS = 0.02    # Dead zone: minimum variance change to be considered meaningful
     
-    BUFFER_SIZE = 10
+    BUFFER_SIZE = 4
     GATE_MAX_DEPTH = 3
     GATE_N_ESTIMATORS = 100
     GATE_LEARNING_RATE = 0.1
