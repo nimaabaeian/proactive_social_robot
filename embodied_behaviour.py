@@ -36,12 +36,13 @@ ALLOWED_ACTIONS = {
 
 
 class EmbodiedBehaviourModule(yarp.RFModule):
-    def __init__(self):
+    def __init__(self, seed: Optional[int] = None):
         super().__init__()
         self.module_name = "embodiedBehaviour"
         self.q_file = "./q_table.json"
         self.db_file = "./last_greeted.db"
         self.data_collection_db = "./data_collection.db"
+        self._rng_seed = seed
 
         self.context_port_name = "/embodiedBehaviour/context:i"
         self.va_port_name = "/embodiedBehaviour/valence_arousal:i"
@@ -73,7 +74,9 @@ class EmbodiedBehaviourModule(yarp.RFModule):
         self._last_face_time = 0.0
         self._transition_done = False
 
-        self.rng = random.Random()
+        self.rng = random.Random(self._rng_seed)
+        if self._rng_seed is not None:
+            print(f"[{self.module_name}] RNG initialized with seed: {self._rng_seed}")
         self.bt_tree = None
         self.bt_branch = None
         self.bt_context = None
@@ -797,10 +800,11 @@ if __name__ == "__main__":
     parser.add_argument("--q_file", default="q_table.json", help="Path to Q-table JSON file")
     parser.add_argument("--db_file", default="last_greeted.db", help="Path to last_greeted database")
     parser.add_argument("--data_db", default="data_collection.db", help="Path to data collection database")
+    parser.add_argument("--seed", type=int, default=None, help="RNG seed for reproducible behavior (optional)")
     args = parser.parse_args()
     
     yarp.Network.init()
-    module = EmbodiedBehaviourModule()
+    module = EmbodiedBehaviourModule(seed=args.seed)
     module.q_file = args.q_file
     module.db_file = args.db_file
     module.data_collection_db = args.data_db

@@ -79,9 +79,16 @@ def select_branch(context: int, q: Dict[str, Any], rng: random.Random) -> Option
     q_vals = q.get(ctx_key, {"LP": 0.0, "HP": 0.0})
     epsilon = q.get("epsilon", DEFAULT_EPSILON)
     
+    # Exploration: random choice
     if rng.random() < epsilon:
         return rng.choice(["LP", "HP"])
-    return "LP" if q_vals.get("LP", 0.0) >= q_vals.get("HP", 0.0) else "HP"
+    
+    # Exploitation: choose best Q-value, randomize on tie
+    lp_val = q_vals.get("LP", 0.0)
+    hp_val = q_vals.get("HP", 0.0)
+    if lp_val == hp_val:
+        return rng.choice(["LP", "HP"])  # Random tie-breaking
+    return "LP" if lp_val > hp_val else "HP"
 
 
 def update_q(q: Dict[str, Any], context: int, branch: str, reward: float, eta: float) -> float:
@@ -119,8 +126,17 @@ def clamp_reward(r: float, lo: float = -1.0, hi: float = 1.0) -> float:
 
 
 def update_after_action(json_path: str, context: int, branch: str,
-                        reward: float, eta: float = 0.1) -> bool:
-    """Atomic: load Q -> update Q -> decay epsilon -> save."""
+                        reward: float, eta: float = 0.1, decay_eps: bool = True) -> bool:
+    """Atomic: load Q -> update Q -> decay epsilon -> save.
+    
+    Args:
+        json_path: Path to Q-table JSON file
+        context: Context (0=calm, 1=lively)
+        branch: Branch taken ("LP" or "HP")
+        reward: Reward value
+        eta: Learning rate
+        decay_eps: Whether to decay epsilon (False to skip decay on failed actions)
+    """
     if context not in (0, 1):
         print(f"[learning] Invalid context {context}, skipping update")
         return False
@@ -128,11 +144,16 @@ def update_after_action(json_path: str, context: int, branch: str,
     q = load_q_table(json_path)
     reward = clamp_reward(reward)
     new_q = update_q(q, context, branch, reward, eta)
-    new_eps = decay_epsilon(q)
+    new_eps = q.get("epsilon", DEFAULT_EPSILON)
+    
+    if decay_eps:
+        new_eps = decay_epsilon(q)
+    
     success = save_q_table(json_path, q)
     
     if success:
         ctx_str = "calm" if context == 0 else "lively"
-        print(f"[learning] Updated Q[{ctx_str}][{branch}]={new_q:.3f}, eps={new_eps:.2f}, r={reward:.3f}")
+        decay_str = f", eps={new_eps:.2f}" if decay_eps else ""
+        print(f"[learning] Updated Q[{ctx_str}][{branch}]={new_q:.3f}{decay_str}, r={reward:.3f}")
     
     return success
