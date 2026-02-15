@@ -1,2058 +1,1520 @@
 #!/usr/bin/env python3
 """
-UNIFIED TEST HARNESS FOR EMBODIED BEHAVIOUR MODULE
+TEST HARNESS - Comprehensive YARP Port Simulator
 
-Comprehensive test environment that simulates all YARP perception ports and
-validates the complete behavior tree logic, state machine, and Q-learning.
+Simulates all YARP ports required by faceSelector.py and interactionManager.py modules:
 
-SYSTEM UNDER TEST:
-    - INACTIVE/ACTIVE state machine (60s timeout)
-    - Tree Selector (context-based LP/HP selection with epsilon-greedy)
-    - LP Tree: MutualGaze → KnownPerson → GreetedToday → ActionWait
-    - HP Tree: KnownPerson → GreetedToday → ActionWait
-    - Q-learning with reward = α*valence + β*arousal
+PUBLISHERS (simulated sensor outputs):
+    /alwayson/vision/landmarks:o    - Face detection landmarks
+    /alwayson/vision/img:o          - Camera images (RGB)
+    /alwayson/stm/context:o         - Short-term memory context
+    /speech2text/text:o             - Speech-to-text output
+    /acapelaSpeak/bookmark:o        - TTS bookmark events
 
-PORT MAPPINGS (Test Harness → Module):
-    /testHarness/context:o         → /embodiedBehaviour/context:i  
-    /testHarness/valence_arousal:o → /embodiedBehaviour/valence_arousal:i
-    /testHarness/face_id:o         → /embodiedBehaviour/face_id:i
-    /testHarness/actions:o         → /embodiedBehaviour/actions:i
-    
-NOTE: Vision port removed - face detection via faceID only
+RECEIVERS (simulated actuator inputs):
+    /acapelaSpeak/speech:i          - TTS speech commands
 
-RPC SERVICES (Mock Servers):
-    /interactionInterface          - Receives "exe <ao_cmd>" 
-    /acapelaSpeak/speech:i         - Receives speech text
+RPC SERVERS (simulated services):
+    /interactionInterface           - Behavior execution
+    /objectRecognition/rpc          - Face registration
+    /faceTracker/rpc                - Face tracking
+    /speech2text/rpc                - STT configuration
 
 SCENARIOS:
-    1. LP Path: New person greeting (mutual gaze + not greeted today)
-    2. LP Path: Action response (greeted today + action)
-    3. HP Path: Unknown person wave (no known faces)
-    4. HP Path: New person greeting (known face + not greeted today)
-    5. State transitions (ACTIVE ↔ INACTIVE)
-    6. Learning validation (Q-table updates, epsilon decay)
-    7. Multi-person target selection (biggest box)
+    1. SS1: Unknown person, not greeted (with/without response)
+    2. SS2: Name acquisition (name provided/not provided)
+    3. SS3: Known person greeting (with/without response)
+    4. SS4: Multi-turn conversation
+    5. Multiple faces with varying spatial states
+    6. Learning state progression (LS1-LS4)
+
+Usage:
+    python test_harness.py [--scenario <name>] [--interactive]
 """
 
-import yarp
-import time
-import random
-import sys
-import signal
-import threading
 import argparse
 import json
 import os
-from datetime import datetime
-from typing import Optional, List, Dict, Any, Tuple
+import random
+import sys
+import threading
+import time
 from dataclasses import dataclass, field
-from enum import Enum
+from datetime import datetime
+from enum import Enum, auto
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+try:
+    import numpy as np
+except ImportError:
+    print("ERROR: NumPy is required. Install with: pip install numpy")
+    sys.exit(1)
+
+try:
+    import yarp
+except ImportError:
+    print("ERROR: YARP Python bindings are required.")
+    sys.exit(1)
 
 
-# =============================================================================
-# Test Result Tracking
-# =============================================================================
+# ==================== Enums and Constants ====================
 
-class TestStatus(Enum):
-    PASS = "PASS"
-    FAIL = "FAIL"
-    PARTIAL = "PARTIAL"
-    TIMEOUT = "TIMEOUT"
+class Zone(Enum):
+    FAR_LEFT = "FAR_LEFT"
+    LEFT = "LEFT"
+    CENTER = "CENTER"
+    RIGHT = "RIGHT"
+    FAR_RIGHT = "FAR_RIGHT"
+    UNKNOWN = "UNKNOWN"
+
+
+class Distance(Enum):
+    SO_CLOSE = "SO_CLOSE"
+    CLOSE = "CLOSE"
+    FAR = "FAR"
+    VERY_FAR = "VERY_FAR"
+    UNKNOWN = "UNKNOWN"
+
+
+class Attention(Enum):
+    MUTUAL_GAZE = "MUTUAL_GAZE"
+    NEAR_GAZE = "NEAR_GAZE"
+    AWAY = "AWAY"
+
+
+class ContextLabel(Enum):
+    UNCERTAIN = -1
+    CALM = 0
+    LIVELY = 1
+
+
+class SocialState(Enum):
+    SS1 = "ss1"  # Unknown, Not Greeted Today
+    SS2 = "ss2"  # Unknown, Greeted Today
+    SS3 = "ss3"  # Known, Not Greeted Today
+    SS4 = "ss4"  # Known, Greeted Today, Not talked to
+    SS5 = "ss5"  # Known, Greeted Today, Talked to
+
+
+# ==================== Data Classes ====================
+
+@dataclass
+class SimulatedFace:
+    """Represents a face in the simulated scene."""
+    face_id: str = "unknown"
+    track_id: int = 0
+    bbox: Tuple[float, float, float, float] = (200.0, 150.0, 120.0, 140.0)  # x, y, w, h
+    zone: Zone = Zone.CENTER
+    distance: Distance = Distance.CLOSE
+    attention: Attention = Attention.MUTUAL_GAZE
+    pitch: float = 0.0
+    yaw: float = 0.0
+    roll: float = 0.0
+    cos_angle: float = 0.95
+    gaze_direction: Tuple[float, float, float] = (0.0, 0.0, 1.0)
+    is_talking: int = 0
+    time_in_view: float = 5.0
+
+    def to_bottle(self, bottle: yarp.Bottle):
+        """Serialize face data to YARP Bottle format."""
+        bottle.addString("face_id")
+        bottle.addString(self.face_id)
+        bottle.addString("track_id")
+        bottle.addInt32(self.track_id)
+        bottle.addString("zone")
+        bottle.addString(self.zone.value)
+        bottle.addString("distance")
+        bottle.addString(self.distance.value)
+        bottle.addString("attention")
+        bottle.addString(self.attention.value)
+        bottle.addString("pitch")
+        bottle.addFloat64(self.pitch)
+        bottle.addString("yaw")
+        bottle.addFloat64(self.yaw)
+        bottle.addString("roll")
+        bottle.addFloat64(self.roll)
+        bottle.addString("cos_angle")
+        bottle.addFloat64(self.cos_angle)
+        bottle.addString("is_talking")
+        bottle.addInt32(self.is_talking)
+        bottle.addString("time_in_view")
+        bottle.addFloat64(self.time_in_view)
+        
+        # Add bbox as nested list
+        bbox_btl = bottle.addList()
+        bbox_btl.addString("bbox")
+        for v in self.bbox:
+            bbox_btl.addFloat64(v)
+        
+        # Add gaze_direction as nested list
+        gaze_btl = bottle.addList()
+        gaze_btl.addString("gaze_direction")
+        for v in self.gaze_direction:
+            gaze_btl.addFloat64(v)
 
 
 @dataclass
-class ExpectedOutcome:
-    """Define expected outcome for a test scenario."""
-    speech_contains: List[str] = field(default_factory=list)  # Expected strings in speech
-    actions: List[str] = field(default_factory=list)  # Expected action commands
-    min_actions: int = 0  # Minimum number of actions expected
-    max_wait_time: float = 20.0  # Maximum time to wait for results
-    q_should_update: bool = False  # Whether Q-table should change
-    description: str = ""
+class ScenarioStep:
+    """A single step in a test scenario."""
+    description: str
+    duration: float = 2.0  # seconds
+    faces: List[SimulatedFace] = field(default_factory=list)
+    context_label: ContextLabel = ContextLabel.CALM
+    stt_responses: List[str] = field(default_factory=list)  # STT outputs to send
+    expected_speech: Optional[str] = None  # Expected TTS from module
 
 
 @dataclass
-class TestResult:
-    """Result of a test scenario."""
-    scenario_name: str
-    status: TestStatus
-    expected: ExpectedOutcome
-    actual_speech: List[str] = field(default_factory=list)
-    actual_actions: List[str] = field(default_factory=list)
-    q_changed: bool = False
-    elapsed_time: float = 0.0
-    errors: List[str] = field(default_factory=list)
-    warnings: List[str] = field(default_factory=list)
-    
-    def add_error(self, msg: str):
-        self.errors.append(msg)
-        if self.status == TestStatus.PASS:
-            self.status = TestStatus.FAIL
-    
-    def add_warning(self, msg: str):
-        self.warnings.append(msg)
-        if self.status == TestStatus.PASS:
-            self.status = TestStatus.PARTIAL
-    
-    def print_summary(self):
-        """Print formatted test result."""
-        status_symbols = {
-            TestStatus.PASS: "[PASS]",
-            TestStatus.FAIL: "[FAIL]",
-            TestStatus.PARTIAL: "[WARN]",
-            TestStatus.TIMEOUT: "[TIME]"
-        }
-        
-        print(f"\n{'='*70}")
-        print(f"{status_symbols[self.status]} {self.scenario_name}")
-        print(f"{'='*70}")
-        print(f"Duration: {self.elapsed_time:.1f}s")
-        
-        if self.expected.description:
-            print(f"Test: {self.expected.description}")
-        
-        # Expected vs Actual
-        print(f"\nExpected:")
-        if self.expected.speech_contains:
-            print(f"  Speech: {self.expected.speech_contains}")
-        if self.expected.actions:
-            print(f"  Actions: {self.expected.actions}")
-        if self.expected.min_actions > 0:
-            print(f"  Min Actions: {self.expected.min_actions}")
-        
-        print(f"\nActual:")
-        if self.actual_speech:
-            print(f"  Speech: {self.actual_speech}")
-        else:
-            print(f"  Speech: (none)")
-        if self.actual_actions:
-            print(f"  Actions: {self.actual_actions}")
-        else:
-            print(f"  Actions: (none)")
-        
-        if self.expected.q_should_update:
-            print(f"  Q-table changed: {'YES' if self.q_changed else 'NO'}")
-        
-        # Errors and warnings
-        if self.errors:
-            print(f"\nErrors:")
-            for err in self.errors:
-                print(f"  - {err}")
-        
-        if self.warnings:
-            print(f"\nWarnings:")
-            for warn in self.warnings:
-                print(f"  - {warn}")
-        
-        print(f"{'='*70}")
+class Scenario:
+    """Complete test scenario."""
+    name: str
+    description: str
+    steps: List[ScenarioStep] = field(default_factory=list)
 
 
-# =============================================================================
-# Mock RPC Servers
-# =============================================================================
+# ==================== Predefined Test Scenarios ====================
 
-class InteractionInterfaceServer(threading.Thread):
-    """
-    Mock RPC server for /interactionInterface.
-    Receives: "exe <ao_command>" and responds "ack"
-    Simulates reactive human behavior by adjusting valence/arousal.
-    """
-    def __init__(self, world_state_manager, port_name: str = "/interactionInterface"):
-        super().__init__(daemon=True)
-        self.port_name = port_name
-        self.port = yarp.RpcServer()
+def create_scenarios() -> Dict[str, Scenario]:
+    """Create all predefined test scenarios."""
+    scenarios = {}
+
+    # ---- Scenario 1: SS1 with successful greeting response ----
+    scenarios["ss1_success"] = Scenario(
+        name="ss1_success",
+        description="Unknown person greets and responds - SS1 → SS2",
+        steps=[
+            ScenarioStep(
+                description="Unknown person enters, centered, close, mutual gaze",
+                duration=3.0,
+                faces=[SimulatedFace(
+                    face_id="unknown",
+                    track_id=1,
+                    zone=Zone.CENTER,
+                    distance=Distance.CLOSE,
+                    attention=Attention.MUTUAL_GAZE,
+                    time_in_view=2.0
+                )],
+                context_label=ContextLabel.CALM,
+            ),
+            ScenarioStep(
+                description="Person responds to greeting",
+                duration=5.0,
+                faces=[SimulatedFace(
+                    face_id="unknown",
+                    track_id=1,
+                    zone=Zone.CENTER,
+                    distance=Distance.CLOSE,
+                    attention=Attention.MUTUAL_GAZE,
+                    time_in_view=5.0
+                )],
+                context_label=ContextLabel.CALM,
+                stt_responses=["Hello!", "Hi there!"],
+            ),
+        ]
+    )
+
+    # ---- Scenario 2: SS1 with no response ----
+    scenarios["ss1_no_response"] = Scenario(
+        name="ss1_no_response",
+        description="Unknown person does not respond to greeting - SS1 fails",
+        steps=[
+            ScenarioStep(
+                description="Unknown person enters but doesn't respond",
+                duration=3.0,
+                faces=[SimulatedFace(
+                    face_id="unknown",
+                    track_id=2,
+                    zone=Zone.CENTER,
+                    distance=Distance.CLOSE,
+                    attention=Attention.AWAY,
+                    time_in_view=3.0
+                )],
+                context_label=ContextLabel.UNCERTAIN,
+            ),
+            ScenarioStep(
+                description="Robot waits for response (timeout)",
+                duration=12.0,
+                faces=[SimulatedFace(
+                    face_id="unknown",
+                    track_id=2,
+                    zone=Zone.CENTER,
+                    distance=Distance.FAR,
+                    attention=Attention.AWAY,
+                    time_in_view=15.0
+                )],
+                context_label=ContextLabel.UNCERTAIN,
+                stt_responses=[],  # No response
+            ),
+        ]
+    )
+
+    # ---- Scenario 3: SS2 with name provided ----
+    scenarios["ss2_name_provided"] = Scenario(
+        name="ss2_name_provided",
+        description="Person provides name when asked - SS2 → SS4",
+        steps=[
+            ScenarioStep(
+                description="Robot asks for name",
+                duration=3.0,
+                faces=[SimulatedFace(
+                    face_id="12345",  # 5-digit code = unknown
+                    track_id=3,
+                    zone=Zone.CENTER,
+                    distance=Distance.CLOSE,
+                    attention=Attention.MUTUAL_GAZE,
+                    time_in_view=10.0
+                )],
+                context_label=ContextLabel.CALM,
+            ),
+            ScenarioStep(
+                description="Person says their name",
+                duration=5.0,
+                faces=[SimulatedFace(
+                    face_id="12345",
+                    track_id=3,
+                    zone=Zone.CENTER,
+                    distance=Distance.CLOSE,
+                    attention=Attention.MUTUAL_GAZE,
+                    time_in_view=15.0
+                )],
+                context_label=ContextLabel.CALM,
+                stt_responses=["My name is Marco", "I'm Marco"],
+            ),
+        ]
+    )
+
+    # ---- Scenario 4: SS2 without name (person refuses) ----
+    scenarios["ss2_no_name"] = Scenario(
+        name="ss2_no_name",
+        description="Person does not provide name - SS2 fails",
+        steps=[
+            ScenarioStep(
+                description="Robot asks for name",
+                duration=3.0,
+                faces=[SimulatedFace(
+                    face_id="67890",
+                    track_id=4,
+                    zone=Zone.CENTER,
+                    distance=Distance.CLOSE,
+                    attention=Attention.NEAR_GAZE,
+                    time_in_view=10.0
+                )],
+                context_label=ContextLabel.LIVELY,
+            ),
+            ScenarioStep(
+                description="Person gives evasive response",
+                duration=5.0,
+                faces=[SimulatedFace(
+                    face_id="67890",
+                    track_id=4,
+                    zone=Zone.CENTER,
+                    distance=Distance.CLOSE,
+                    attention=Attention.NEAR_GAZE,
+                    time_in_view=15.0
+                )],
+                context_label=ContextLabel.LIVELY,
+                stt_responses=["I don't want to say", "None of your business"],
+            ),
+        ]
+    )
+
+    # ---- Scenario 5: SS3 known person greeting ----
+    scenarios["ss3_known_greeting"] = Scenario(
+        name="ss3_known_greeting",
+        description="Known person enters and is greeted by name - SS3 → SS4",
+        steps=[
+            ScenarioStep(
+                description="Known person (Alice) enters",
+                duration=3.0,
+                faces=[SimulatedFace(
+                    face_id="Alice",
+                    track_id=5,
+                    zone=Zone.LEFT,
+                    distance=Distance.CLOSE,
+                    attention=Attention.MUTUAL_GAZE,
+                    time_in_view=2.0
+                )],
+                context_label=ContextLabel.CALM,
+            ),
+            ScenarioStep(
+                description="Alice responds to personal greeting",
+                duration=5.0,
+                faces=[SimulatedFace(
+                    face_id="Alice",
+                    track_id=5,
+                    zone=Zone.CENTER,
+                    distance=Distance.CLOSE,
+                    attention=Attention.MUTUAL_GAZE,
+                    time_in_view=7.0
+                )],
+                context_label=ContextLabel.CALM,
+                stt_responses=["Hello iCub!", "Hi, nice to see you again!"],
+            ),
+        ]
+    )
+
+    # ---- Scenario 6: SS4 conversation ----
+    scenarios["ss4_conversation"] = Scenario(
+        name="ss4_conversation",
+        description="Multi-turn conversation - SS4 → SS5",
+        steps=[
+            ScenarioStep(
+                description="Robot starts conversation",
+                duration=3.0,
+                faces=[SimulatedFace(
+                    face_id="Bob",
+                    track_id=6,
+                    zone=Zone.CENTER,
+                    distance=Distance.SO_CLOSE,
+                    attention=Attention.MUTUAL_GAZE,
+                    time_in_view=20.0
+                )],
+                context_label=ContextLabel.LIVELY,
+            ),
+            ScenarioStep(
+                description="Turn 1: User responds",
+                duration=5.0,
+                faces=[SimulatedFace(
+                    face_id="Bob",
+                    track_id=6,
+                    zone=Zone.CENTER,
+                    distance=Distance.SO_CLOSE,
+                    attention=Attention.MUTUAL_GAZE,
+                    time_in_view=25.0
+                )],
+                context_label=ContextLabel.LIVELY,
+                stt_responses=["I'm doing great, thanks for asking!"],
+            ),
+            ScenarioStep(
+                description="Turn 2: Continued conversation",
+                duration=5.0,
+                faces=[SimulatedFace(
+                    face_id="Bob",
+                    track_id=6,
+                    zone=Zone.CENTER,
+                    distance=Distance.SO_CLOSE,
+                    attention=Attention.MUTUAL_GAZE,
+                    time_in_view=30.0
+                )],
+                context_label=ContextLabel.LIVELY,
+                stt_responses=["Yes, I went to the park today"],
+            ),
+            ScenarioStep(
+                description="Turn 3: Final exchange",
+                duration=5.0,
+                faces=[SimulatedFace(
+                    face_id="Bob",
+                    track_id=6,
+                    zone=Zone.CENTER,
+                    distance=Distance.CLOSE,
+                    attention=Attention.MUTUAL_GAZE,
+                    time_in_view=35.0
+                )],
+                context_label=ContextLabel.LIVELY,
+                stt_responses=["It was really nice, the weather was perfect"],
+            ),
+        ]
+    )
+
+    # ---- Scenario 7: Multiple faces ----
+    scenarios["multi_face"] = Scenario(
+        name="multi_face",
+        description="Multiple faces with varying eligibility",
+        steps=[
+            ScenarioStep(
+                description="Three faces: unknown (center), known SS5 (left), unknown (right-far)",
+                duration=5.0,
+                faces=[
+                    SimulatedFace(
+                        face_id="unknown",
+                        track_id=10,
+                        bbox=(300.0, 150.0, 100.0, 120.0),
+                        zone=Zone.CENTER,
+                        distance=Distance.CLOSE,
+                        attention=Attention.MUTUAL_GAZE,
+                        time_in_view=3.0
+                    ),
+                    SimulatedFace(
+                        face_id="Charlie",  # Known, already talked (SS5)
+                        track_id=11,
+                        bbox=(50.0, 160.0, 90.0, 110.0),
+                        zone=Zone.LEFT,
+                        distance=Distance.CLOSE,
+                        attention=Attention.MUTUAL_GAZE,
+                        time_in_view=30.0
+                    ),
+                    SimulatedFace(
+                        face_id="unknown",
+                        track_id=12,
+                        bbox=(500.0, 200.0, 80.0, 95.0),
+                        zone=Zone.FAR_RIGHT,
+                        distance=Distance.VERY_FAR,
+                        attention=Attention.AWAY,
+                        time_in_view=1.0
+                    ),
+                ],
+                context_label=ContextLabel.CALM,
+            ),
+        ]
+    )
+
+    # ---- Scenario 8: Spatial state variations ----
+    scenarios["spatial_states"] = Scenario(
+        name="spatial_states",
+        description="Face transitions through different spatial states",
+        steps=[
+            ScenarioStep(
+                description="Person far away, not looking",
+                duration=3.0,
+                faces=[SimulatedFace(
+                    face_id="unknown",
+                    track_id=20,
+                    zone=Zone.FAR_RIGHT,
+                    distance=Distance.VERY_FAR,
+                    attention=Attention.AWAY,
+                    time_in_view=1.0
+                )],
+                context_label=ContextLabel.UNCERTAIN,
+            ),
+            ScenarioStep(
+                description="Person approaches, near gaze",
+                duration=3.0,
+                faces=[SimulatedFace(
+                    face_id="unknown",
+                    track_id=20,
+                    zone=Zone.RIGHT,
+                    distance=Distance.FAR,
+                    attention=Attention.NEAR_GAZE,
+                    time_in_view=4.0
+                )],
+                context_label=ContextLabel.CALM,
+            ),
+            ScenarioStep(
+                description="Person in center, close, mutual gaze",
+                duration=3.0,
+                faces=[SimulatedFace(
+                    face_id="unknown",
+                    track_id=20,
+                    zone=Zone.CENTER,
+                    distance=Distance.CLOSE,
+                    attention=Attention.MUTUAL_GAZE,
+                    time_in_view=7.0
+                )],
+                context_label=ContextLabel.CALM,
+            ),
+            ScenarioStep(
+                description="Person very close",
+                duration=3.0,
+                faces=[SimulatedFace(
+                    face_id="unknown",
+                    track_id=20,
+                    zone=Zone.CENTER,
+                    distance=Distance.SO_CLOSE,
+                    attention=Attention.MUTUAL_GAZE,
+                    time_in_view=10.0
+                )],
+                context_label=ContextLabel.LIVELY,
+            ),
+        ]
+    )
+
+    # ---- Scenario 9: Context variations ----
+    scenarios["context_variations"] = Scenario(
+        name="context_variations",
+        description="Different ambient context labels",
+        steps=[
+            ScenarioStep(
+                description="Calm environment",
+                duration=4.0,
+                faces=[SimulatedFace(
+                    face_id="Diana",
+                    track_id=30,
+                    zone=Zone.CENTER,
+                    distance=Distance.CLOSE,
+                    attention=Attention.MUTUAL_GAZE,
+                    time_in_view=5.0
+                )],
+                context_label=ContextLabel.CALM,
+            ),
+            ScenarioStep(
+                description="Lively environment",
+                duration=4.0,
+                faces=[SimulatedFace(
+                    face_id="Diana",
+                    track_id=30,
+                    zone=Zone.CENTER,
+                    distance=Distance.CLOSE,
+                    attention=Attention.MUTUAL_GAZE,
+                    time_in_view=9.0
+                )],
+                context_label=ContextLabel.LIVELY,
+            ),
+            ScenarioStep(
+                description="Uncertain environment",
+                duration=4.0,
+                faces=[SimulatedFace(
+                    face_id="Diana",
+                    track_id=30,
+                    zone=Zone.CENTER,
+                    distance=Distance.CLOSE,
+                    attention=Attention.NEAR_GAZE,
+                    time_in_view=13.0
+                )],
+                context_label=ContextLabel.UNCERTAIN,
+            ),
+        ]
+    )
+
+    # ---- Scenario 10: Person talking ----
+    scenarios["talking_person"] = Scenario(
+        name="talking_person",
+        description="Person detected as talking",
+        steps=[
+            ScenarioStep(
+                description="Person starts silent",
+                duration=2.0,
+                faces=[SimulatedFace(
+                    face_id="Eve",
+                    track_id=40,
+                    zone=Zone.CENTER,
+                    distance=Distance.CLOSE,
+                    attention=Attention.MUTUAL_GAZE,
+                    is_talking=0,
+                    time_in_view=2.0
+                )],
+                context_label=ContextLabel.CALM,
+            ),
+            ScenarioStep(
+                description="Person is talking",
+                duration=5.0,
+                faces=[SimulatedFace(
+                    face_id="Eve",
+                    track_id=40,
+                    zone=Zone.CENTER,
+                    distance=Distance.CLOSE,
+                    attention=Attention.MUTUAL_GAZE,
+                    is_talking=1,
+                    time_in_view=7.0
+                )],
+                context_label=ContextLabel.CALM,
+                stt_responses=["I have a question for you"],
+            ),
+        ]
+    )
+
+    # ---- Scenario 11: Full interaction flow (SS1 → SS2 → SS4 → SS5) ----
+    scenarios["full_flow"] = Scenario(
+        name="full_flow",
+        description="Complete interaction: unknown → name → conversation",
+        steps=[
+            ScenarioStep(
+                description="Unknown person approaches",
+                duration=3.0,
+                faces=[SimulatedFace(
+                    face_id="unknown",
+                    track_id=50,
+                    zone=Zone.CENTER,
+                    distance=Distance.CLOSE,
+                    attention=Attention.MUTUAL_GAZE,
+                    time_in_view=3.0
+                )],
+                context_label=ContextLabel.CALM,
+            ),
+            ScenarioStep(
+                description="Person responds to greeting (SS1 → SS2)",
+                duration=5.0,
+                faces=[SimulatedFace(
+                    face_id="unknown",
+                    track_id=50,
+                    zone=Zone.CENTER,
+                    distance=Distance.CLOSE,
+                    attention=Attention.MUTUAL_GAZE,
+                    time_in_view=8.0
+                )],
+                context_label=ContextLabel.CALM,
+                stt_responses=["Hello!"],
+            ),
+            ScenarioStep(
+                description="Person provides name (SS2 → SS4)",
+                duration=5.0,
+                faces=[SimulatedFace(
+                    face_id="unknown",
+                    track_id=50,
+                    zone=Zone.CENTER,
+                    distance=Distance.CLOSE,
+                    attention=Attention.MUTUAL_GAZE,
+                    time_in_view=13.0
+                )],
+                context_label=ContextLabel.CALM,
+                stt_responses=["My name is Francesco"],
+            ),
+            ScenarioStep(
+                description="Conversation turn 1 (SS4)",
+                duration=5.0,
+                faces=[SimulatedFace(
+                    face_id="Francesco",
+                    track_id=50,
+                    zone=Zone.CENTER,
+                    distance=Distance.CLOSE,
+                    attention=Attention.MUTUAL_GAZE,
+                    time_in_view=18.0
+                )],
+                context_label=ContextLabel.CALM,
+                stt_responses=["I'm doing well, thank you"],
+            ),
+            ScenarioStep(
+                description="Conversation ends (SS4 → SS5)",
+                duration=5.0,
+                faces=[SimulatedFace(
+                    face_id="Francesco",
+                    track_id=50,
+                    zone=Zone.CENTER,
+                    distance=Distance.CLOSE,
+                    attention=Attention.MUTUAL_GAZE,
+                    time_in_view=23.0
+                )],
+                context_label=ContextLabel.CALM,
+                stt_responses=["Goodbye!"],
+            ),
+        ]
+    )
+
+    # ---- Scenario 12: Learning states test ----
+    scenarios["learning_states"] = Scenario(
+        name="learning_states",
+        description="Test faces at different learning state requirements",
+        steps=[
+            ScenarioStep(
+                description="LS1 face: Any spatial state allowed",
+                duration=4.0,
+                faces=[SimulatedFace(
+                    face_id="unknown",
+                    track_id=60,
+                    zone=Zone.FAR_LEFT,  # Would fail LS2+
+                    distance=Distance.VERY_FAR,  # Would fail LS2+
+                    attention=Attention.AWAY,  # Would fail LS3+
+                    time_in_view=2.0
+                )],
+                context_label=ContextLabel.CALM,
+            ),
+            ScenarioStep(
+                description="LS2 requirements: CENTER zone, FAR distance OK",
+                duration=4.0,
+                faces=[SimulatedFace(
+                    face_id="unknown",
+                    track_id=61,
+                    zone=Zone.CENTER,
+                    distance=Distance.FAR,
+                    attention=Attention.AWAY,  # AWAY still OK for LS2
+                    time_in_view=2.0
+                )],
+                context_label=ContextLabel.CALM,
+            ),
+            ScenarioStep(
+                description="LS3 requirements: CLOSE, NEAR_GAZE minimum",
+                duration=4.0,
+                faces=[SimulatedFace(
+                    face_id="unknown",
+                    track_id=62,
+                    zone=Zone.RIGHT,
+                    distance=Distance.CLOSE,
+                    attention=Attention.NEAR_GAZE,
+                    time_in_view=2.0
+                )],
+                context_label=ContextLabel.CALM,
+            ),
+            ScenarioStep(
+                description="LS4 requirements: SO_CLOSE, MUTUAL_GAZE only",
+                duration=4.0,
+                faces=[SimulatedFace(
+                    face_id="unknown",
+                    track_id=63,
+                    zone=Zone.LEFT,
+                    distance=Distance.SO_CLOSE,
+                    attention=Attention.MUTUAL_GAZE,
+                    time_in_view=2.0
+                )],
+                context_label=ContextLabel.CALM,
+            ),
+        ]
+    )
+
+    return scenarios
+
+
+# ==================== Test Harness Class ====================
+
+class TestHarness:
+    """Main test harness managing all simulated YARP ports and scenarios."""
+
+    def __init__(self, verbose: bool = True):
+        self.verbose = verbose
         self._running = False
-        self.received_commands = []
         self._lock = threading.Lock()
-        self.world_state = world_state_manager
-        self.action_count = 0
-        self.last_action_time = 0
-        
-        # Reaction configs: (delay_sec, valence_delta, arousal_delta, description)
-        self.reactions = {
-            'ao_start': (0.0, 0.0, 0.0, "▶️  System activated"),
-            'ao_stop': (0.0, 0.0, 0.0, "⏹️  System deactivated"),
-            'ao_wave': (0.3, +0.10, +0.05, "👋 Wave response - engagement up"),
-            'ao_greet': (0.3, +0.15, +0.08, "😊 Greeting response - positive"),
-            'ao_yawn_phone': (0.3, -0.05, -0.02, "📱 Phone yawn - slight negative"),
-            'ao_curious_lean_in': (0.3, +0.12, +0.06, "🤔 Curious lean"),
-            'ao_look_around': (0.3, -0.02, +0.01, "👀 Looking around"),
-            'ao_coffee_break': (0.3, +0.08, -0.02, "☕ Coffee break"),
-        }
-    
-    def open(self) -> bool:
-        if not self.port.open(self.port_name):
-            print(f"[InteractionInterface] ❌ Failed to open {self.port_name}")
+
+        # Episode and context tracking
+        self.episode_id = 0
+        self.chunk_id = -1
+        self.current_context = ContextLabel.CALM
+
+        # Current scene state
+        self.current_faces: List[SimulatedFace] = []
+        self.stt_queue: List[str] = []  # Queue of STT responses to send
+        self.received_speech: List[str] = []  # Captured TTS commands
+        self.rpc_logs: List[Dict] = []  # Captured RPC calls
+
+        # YARP ports - Publishers
+        self.landmarks_port: Optional[yarp.BufferedPortBottle] = None
+        self.img_port: Optional[yarp.BufferedPortImageRgb] = None
+        self.context_port: Optional[yarp.BufferedPortBottle] = None
+        self.stt_port: Optional[yarp.BufferedPortBottle] = None
+        self.bookmark_port: Optional[yarp.BufferedPortBottle] = None
+
+        # YARP ports - Receivers
+        self.speech_in_port: Optional[yarp.BufferedPortBottle] = None
+
+        # YARP RPC servers
+        self.interaction_interface_rpc: Optional[yarp.RpcServer] = None
+        self.object_recognition_rpc: Optional[yarp.RpcServer] = None
+        self.face_tracker_rpc: Optional[yarp.RpcServer] = None
+        self.stt_rpc: Optional[yarp.RpcServer] = None
+
+        # Background threads
+        self._publish_thread: Optional[threading.Thread] = None
+        self._rpc_threads: List[threading.Thread] = []
+
+        # Timing
+        self.publish_rate = 20.0  # Hz for landmarks/images
+        self.context_rate = 0.2  # Hz for context
+
+        # Image dimensions
+        self.img_width = 640
+        self.img_height = 480
+
+        # Faces directory for mock registration
+        self.faces_dir = "/tmp/test_harness_faces"
+        os.makedirs(self.faces_dir, exist_ok=True)
+
+    def log(self, level: str, message: str):
+        """Print log message with timestamp."""
+        if self.verbose or level in ("ERROR", "WARNING"):
+            timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            print(f"[{timestamp}] [{level}] [TestHarness] {message}")
+
+    def configure(self) -> bool:
+        """Open all YARP ports."""
+        try:
+            # Publishers
+            self.landmarks_port = yarp.BufferedPortBottle()
+            if not self.landmarks_port.open("/alwayson/vision/landmarks:o"):
+                self.log("ERROR", "Failed to open landmarks port")
+                return False
+
+            self.img_port = yarp.BufferedPortImageRgb()
+            if not self.img_port.open("/alwayson/vision/img:o"):
+                self.log("ERROR", "Failed to open image port")
+                return False
+
+            self.context_port = yarp.BufferedPortBottle()
+            if not self.context_port.open("/alwayson/stm/context:o"):
+                self.log("ERROR", "Failed to open context port")
+                return False
+
+            self.stt_port = yarp.BufferedPortBottle()
+            if not self.stt_port.open("/speech2text/text:o"):
+                self.log("ERROR", "Failed to open STT port")
+                return False
+
+            self.bookmark_port = yarp.BufferedPortBottle()
+            if not self.bookmark_port.open("/acapelaSpeak/bookmark:o"):
+                self.log("ERROR", "Failed to open bookmark port")
+                return False
+
+            # Receivers
+            self.speech_in_port = yarp.BufferedPortBottle()
+            if not self.speech_in_port.open("/acapelaSpeak/speech:i"):
+                self.log("ERROR", "Failed to open speech input port")
+                return False
+
+            # RPC Servers
+            self.interaction_interface_rpc = yarp.RpcServer()
+            if not self.interaction_interface_rpc.open("/interactionInterface"):
+                self.log("ERROR", "Failed to open interactionInterface RPC")
+                return False
+
+            self.object_recognition_rpc = yarp.RpcServer()
+            if not self.object_recognition_rpc.open("/objectRecognition/rpc"):
+                self.log("ERROR", "Failed to open objectRecognition RPC")
+                return False
+
+            self.face_tracker_rpc = yarp.RpcServer()
+            if not self.face_tracker_rpc.open("/faceTracker/rpc"):
+                self.log("ERROR", "Failed to open faceTracker RPC")
+                return False
+
+            self.stt_rpc = yarp.RpcServer()
+            if not self.stt_rpc.open("/speech2text/rpc"):
+                self.log("ERROR", "Failed to open speech2text RPC")
+                return False
+
+            self.log("INFO", "All ports opened successfully")
+            return True
+
+        except Exception as e:
+            self.log("ERROR", f"Configuration failed: {e}")
             return False
-        print(f"[InteractionInterface] ✅ Listening on {self.port_name}")
-        return True
-    
-    def run(self):
-        """Listen for commands and simulate reactive behavior."""
+
+    def start(self):
+        """Start background publishing and RPC handling threads."""
         self._running = True
-        
-        while self._running:
-            try:
-                bottle_in = yarp.Bottle()
-                bottle_out = yarp.Bottle()
-                
-                if self.port.read(bottle_in, True):
-                    cmd_str = bottle_in.toString()
-                    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                    
-                    # Parse command
-                    action = None
-                    if bottle_in.size() >= 2 and bottle_in.get(0).asString() == "exe":
-                        action = bottle_in.get(1).asString()
-                    
-                    # Log
-                    with self._lock:
-                        self.action_count += 1
-                        self.last_action_time = time.time()
-                        self.received_commands.append({
-                            'time': timestamp,
-                            'raw': cmd_str,
-                            'action': action,
-                            'count': self.action_count
-                        })
-                    
-                    print(f"\n{'='*70}")
-                    print(f"[ACTION #{self.action_count}] {action or cmd_str} @ {timestamp}")
-                    print(f"{'='*70}")
-                    
-                    # Reply with ack
-                    bottle_out.addString("ack")
-                    self.port.reply(bottle_out)
-                    
-                    # Trigger reactive behavior
-                    if action and action in self.reactions:
-                        threading.Thread(
-                            target=self._simulate_reaction,
-                            args=(action, self.reactions[action]),
-                            daemon=True
-                        ).start()
-                        
-            except Exception as e:
-                if self._running:
-                    print(f"[InteractionInterface] Error: {e}")
-        
-        print("[InteractionInterface] Stopped")
-    
-    def _simulate_reaction(self, action: str, config: Tuple[float, float, float, str]):
-        """Simulate human reaction to robot action."""
-        delay, v_delta, a_delta, description = config
-        
-        if delay > 0:
-            time.sleep(delay)
-        
-        if v_delta != 0 or a_delta != 0:
-            state = self.world_state.get_state()
-            new_v = max(-1.0, min(1.0, state['valence'] + v_delta))
-            new_a = max(0.0, min(1.0, state['arousal'] + a_delta))
-            
-            self.world_state.update_state(valence=new_v, arousal=new_a)
-            
-            print(f"[Reaction] {description}")
-            print(f"           Valence: {state['valence']:.2f} → {new_v:.2f} (Δ{v_delta:+.2f})")
-            print(f"           Arousal: {state['arousal']:.2f} → {new_a:.2f} (Δ{a_delta:+.2f})")
-    
+
+        # Start publish thread
+        self._publish_thread = threading.Thread(target=self._publish_loop, daemon=True)
+        self._publish_thread.start()
+
+        # Start RPC handler threads
+        rpc_handlers = [
+            (self.interaction_interface_rpc, self._handle_interaction_interface_rpc),
+            (self.object_recognition_rpc, self._handle_object_recognition_rpc),
+            (self.face_tracker_rpc, self._handle_face_tracker_rpc),
+            (self.stt_rpc, self._handle_stt_rpc),
+        ]
+
+        for rpc_port, handler in rpc_handlers:
+            t = threading.Thread(target=self._rpc_loop, args=(rpc_port, handler), daemon=True)
+            t.start()
+            self._rpc_threads.append(t)
+
+        # Start speech receiver thread
+        speech_thread = threading.Thread(target=self._speech_receiver_loop, daemon=True)
+        speech_thread.start()
+        self._rpc_threads.append(speech_thread)
+
+        self.log("INFO", "Test harness started")
+
     def stop(self):
+        """Stop all threads and close ports."""
         self._running = False
-        self.port.interrupt()
-        self.port.close()
-    
-    def get_commands(self) -> List[Dict]:
-        with self._lock:
-            return list(self.received_commands)
-    
-    def clear_commands(self):
-        with self._lock:
-            self.received_commands.clear()
-    
-    def get_action_count(self) -> int:
-        with self._lock:
-            return self.action_count
-    
-    def get_last_action(self) -> Optional[str]:
-        with self._lock:
-            if self.received_commands:
-                return self.received_commands[-1].get('action')
-            return None
+        time.sleep(0.2)
 
+        for port in [self.landmarks_port, self.img_port, self.context_port,
+                     self.stt_port, self.bookmark_port, self.speech_in_port,
+                     self.interaction_interface_rpc, self.object_recognition_rpc,
+                     self.face_tracker_rpc, self.stt_rpc]:
+            if port:
+                try:
+                    port.interrupt()
+                    port.close()
+                except Exception:
+                    pass
 
-class SpeechServer(threading.Thread):
-    """
-    Mock server for /acapelaSpeak/speech:i.
-    Receives speech text from module.
-    """
-    def __init__(self, port_name: str = "/acapelaSpeak/speech:i"):
-        super().__init__(daemon=True)
-        self.port_name = port_name
-        self.port = yarp.BufferedPortBottle()
-        self._running = False
-        self.received_speech = []
-        self._lock = threading.Lock()
-    
-    def open(self) -> bool:
-        if not self.port.open(self.port_name):
-            print(f"[SpeechServer] ❌ Failed to open {self.port_name}")
-            return False
-        print(f"[SpeechServer] ✅ Listening on {self.port_name}")
-        return True
-    
-    def run(self):
-        self._running = True
+        self.log("INFO", "Test harness stopped")
+
+    # ==================== Publishing ====================
+
+    def _publish_loop(self):
+        """Main loop for publishing sensor data."""
+        last_landmarks = 0.0
+        last_context = 0.0
+        landmarks_period = 1.0 / self.publish_rate
+        context_period = 1.0 / self.context_rate
+
         while self._running:
-            try:
-                bottle = self.port.read(False)
-                if bottle is not None:
-                    text = bottle.toString()
-                    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                    
-                    with self._lock:
-                        self.received_speech.append({
-                            'time': timestamp,
-                            'text': text
-                        })
-                    
-                    print(f"[Speech] 💬 [{timestamp}] {text}")
+            now = time.time()
+
+            # Publish landmarks at high rate
+            if now - last_landmarks >= landmarks_period:
+                self._publish_landmarks()
+                self._publish_image()
+                last_landmarks = now
+
+            # Publish context at lower rate
+            if now - last_context >= context_period:
+                self._publish_context()
+                last_context = now
+
+            time.sleep(0.01)
+
+    def _publish_landmarks(self):
+        """Publish current face landmarks."""
+        with self._lock:
+            faces = self.current_faces.copy()
+
+        bottle = self.landmarks_port.prepare()
+        bottle.clear()
+
+        for face in faces:
+            face_btl = bottle.addList()
+            face.to_bottle(face_btl)
+
+        self.landmarks_port.write()
+
+    def _publish_image(self):
+        """Publish a synthetic test image."""
+        if self.img_port.getOutputCount() == 0:
+            return
+
+        img = self.img_port.prepare()
+        img.resize(self.img_width, self.img_height)
+
+        # Create synthetic RGB image with face boxes
+        rgb_data = np.zeros((self.img_height, self.img_width, 3), dtype=np.uint8)
+        rgb_data[:, :, 0] = 100  # Gray-ish background
+        rgb_data[:, :, 1] = 100
+        rgb_data[:, :, 2] = 100
+
+        # Draw face boxes
+        with self._lock:
+            for face in self.current_faces:
+                x, y, w, h = face.bbox
+                x1, y1 = int(x), int(y)
+                x2, y2 = int(x + w), int(y + h)
+                
+                # Clip to image bounds
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(self.img_width - 1, x2), min(self.img_height - 1, y2)
+
+                # Draw rectangle (green for mutual gaze, yellow for near, white for away)
+                if face.attention == Attention.MUTUAL_GAZE:
+                    color = (0, 255, 0)
+                elif face.attention == Attention.NEAR_GAZE:
+                    color = (255, 255, 0)
                 else:
-                    time.sleep(0.01)
-            except Exception as e:
-                if self._running:
-                    print(f"[SpeechServer] Error: {e}")
-        
-        print("[SpeechServer] Stopped")
-    
-    def stop(self):
-        self._running = False
-        self.port.interrupt()
-        self.port.close()
-    
-    def get_speech(self) -> List[Dict]:
-        with self._lock:
-            return list(self.received_speech)
-    
-    def clear_speech(self):
-        with self._lock:
-            self.received_speech.clear()
-    
-    def get_last_speech(self) -> Optional[str]:
-        with self._lock:
-            if self.received_speech:
-                return self.received_speech[-1].get('text')
-            return None
+                    color = (255, 255, 255)
 
+                # Top and bottom edges
+                rgb_data[y1:y1+2, x1:x2] = color
+                rgb_data[y2-2:y2, x1:x2] = color
+                # Left and right edges
+                rgb_data[y1:y2, x1:x1+2] = color
+                rgb_data[y1:y2, x2-2:x2] = color
 
-# =============================================================================
-# World State Manager (Thread-Safe)
-# =============================================================================
+        # Copy to YARP image
+        row = img.getRowSize()
+        buf = img.getRawImage()
+        out_raw = np.frombuffer(buf, dtype=np.uint8, count=self.img_height * row)
+        out_raw = out_raw.reshape((self.img_height, row))
+        out_raw[:, :self.img_width * 3] = rgb_data.reshape((self.img_height, self.img_width * 3))
 
-class WorldStateManager:
-    """Thread-safe manager for simulated world state."""
-    
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._state = {
-            # Face detection (via faceID only - no vision port)
-            'faces_count': 0,  # Total faces (known + unknown)
-            
-            # Context (-1=uncertain, 0=calm, 1=lively)
-            'context_label': -1,
-            'episode_id': 1,
-            'chunk_id': 1,
-            
-            # Known faces: [{name, confidence, box}]
-            'known_faces': [],
-            
-            # Valence/Arousal (per face, but we use global for simplicity)
-            'valence': 0.5,
-            'arousal': 0.3,
-            
-            # Detected actions: {person_id: (action, prob)}
-            'detected_actions': {},
-        }
-    
-    def get_state(self) -> Dict[str, Any]:
-        """Get copy of current state."""
-        with self._lock:
-            state = dict(self._state)
-            state['known_faces'] = list(self._state['known_faces'])
-            state['detected_actions'] = dict(self._state['detected_actions'])
-            return state
-    
-    def update_state(self, **kwargs):
-        """Update specific state fields."""
-        with self._lock:
-            for key, value in kwargs.items():
-                if key in self._state:
-                    self._state[key] = value
-    
-    def add_face(self, name: str, confidence: float, box: List[float]):
-        """Add a known face."""
-        with self._lock:
-            self._state['known_faces'].append({
-                'name': name,
-                'confidence': confidence,
-                'box': box  # [x1, y1, x2, y2]
-            })
-            self._state['faces_count'] = len(self._state['known_faces'])
-    
-    def set_faces_count(self, count: int):
-        """Set faces count (for unknown faces)."""
-        with self._lock:
-            self._state['faces_count'] = count
-    
-    def clear_faces(self):
-        """Remove all faces."""
-        with self._lock:
-            self._state['known_faces'] = []
-            self._state['faces_count'] = 0
-    
-    def set_action(self, person_id: str, action: str, prob: float = 0.9):
-        """Set detected action for a person."""
-        with self._lock:
-            self._state['detected_actions'][person_id] = (action, prob)
-    
-    def clear_actions(self):
-        """Clear all detected actions."""
-        with self._lock:
-            self._state['detected_actions'] = {}
+        self.img_port.write()
 
-
-# =============================================================================
-# Data Pump (20Hz Continuous Publishing)
-# =============================================================================
-
-class DataPump(threading.Thread):
-    """
-    Continuously publishes perception data at 20Hz.
-    Maintains stable data stream to module input ports.
-    """
-    
-    def __init__(self, world_state: WorldStateManager):
-        super().__init__(daemon=True)
-        self.world_state = world_state
-        self._running = False
-        
-        # Output ports (NO vision port - face detection via faceID only)
-        self.context_port = yarp.BufferedPortBottle()
-        self.va_port = yarp.BufferedPortBottle()
-        self.face_id_port = yarp.BufferedPortBottle()
-        self.action_port = yarp.BufferedPortBottle()
-        
-        # Port names
-        self.port_names = {
-            'context': "/testHarness/context:o",
-            'va': "/testHarness/valence_arousal:o",
-            'face_id': "/testHarness/face_id:o",
-            'actions': "/testHarness/actions:o",
-        }
-        
-        # Target ports
-        self.targets = {
-            'context': "/embodiedBehaviour/context:i",
-            'va': "/embodiedBehaviour/valence_arousal:i",
-            'face_id': "/embodiedBehaviour/face_id:i",
-            'actions': "/embodiedBehaviour/actions:i",
-        }
-        
-        self.publish_count = 0
-    
-    def open_ports(self) -> bool:
-        """Open all output ports."""
-        ports = [
-            (self.context_port, self.port_names['context']),
-            (self.va_port, self.port_names['va']),
-            (self.face_id_port, self.port_names['face_id']),
-            (self.action_port, self.port_names['actions']),
-        ]
-        
-        for port, name in ports:
-            if not port.open(name):
-                print(f"[DataPump] ❌ Failed to open {name}")
-                return False
-        
-        print(f"[DataPump] ✅ All ports opened")
-        return True
-    
-    def connect_ports(self, timeout: float = 15.0) -> bool:
-        """Connect to module input ports."""
-        connections = [
-            (self.port_names['context'], self.targets['context']),
-            (self.port_names['va'], self.targets['va']),
-            (self.port_names['face_id'], self.targets['face_id']),
-            (self.port_names['actions'], self.targets['actions']),
-        ]
-        
-        print("\n[DataPump] Waiting for module ports...")
-        start_time = time.time()
-        
-        for src, dst in connections:
-            while time.time() - start_time < timeout:
-                if yarp.Network.exists(dst):
-                    break
-                time.sleep(0.5)
-            else:
-                print(f"[DataPump] ⏱️  Timeout waiting for {dst}")
-                return False
-            
-            if not yarp.Network.connect(src, dst):
-                print(f"[DataPump] ❌ Failed: {src} → {dst}")
-                return False
-            print(f"[DataPump] ✅ {src} → {dst}")
-        
-        return True
-    
-    def close_ports(self):
-        """Close all ports."""
-        for port in [self.context_port, self.va_port,
-                     self.face_id_port, self.action_port]:
-            port.interrupt()
-            port.close()
-    
-    def run(self):
-        """20Hz publishing loop."""
-        print("[DataPump] ▶️  Starting 20Hz loop...")
-        self._running = True
-        
-        while self._running:
-            try:
-                self.publish_count += 1
-                state = self.world_state.get_state()
-                
-                # Add small noise to VA for realism
-                v_noise = random.uniform(-0.02, 0.02)
-                a_noise = random.uniform(-0.02, 0.02)
-                v = max(-1.0, min(1.0, state['valence'] + v_noise))
-                a = max(0.0, min(1.0, state['arousal'] + a_noise))
-                
-                # Publish all (NO vision - face detection via faceID only)
-                if self.publish_count % 10 == 0:  # Context at 2Hz
-                    self._publish_context(state)
-                self._publish_face_id(state)
-                self._publish_va(state, v, a)
-                self._publish_actions(state)
-                
-                # Status log every 10s
-                if self.publish_count % 200 == 0:
-                    print(f"[DataPump] 📊 {self.publish_count} msgs | "
-                          f"Faces={state['faces_count']} "
-                          f"Ctx={state['context_label']} V={state['valence']:.2f} A={state['arousal']:.2f}")
-                
-                time.sleep(0.05)  # 20Hz
-                
-            except Exception as e:
-                if self._running:
-                    print(f"[DataPump] Error: {e}")
-        
-        print("[DataPump] ⏹️  Stopped")
-    
-    def _publish_context(self, state: Dict):
-        """
-        Publish context.
-        Format: <episode_id> <chunk_id> <label>
-        """
+    def _publish_context(self):
+        """Publish current context."""
         bottle = self.context_port.prepare()
         bottle.clear()
-        
-        bottle.addInt32(state['episode_id'])
-        bottle.addInt32(state['chunk_id'])
-        bottle.addInt32(state['context_label'])
-        
+
+        bottle.addInt32(self.episode_id)
+        bottle.addInt32(self.chunk_id)
+        bottle.addInt32(self.current_context.value)
+
         self.context_port.write()
-    
-    def _publish_face_id(self, state: Dict):
-        """
-        Publish face IDs.
-        Format: ((class <name>) (score <conf>) (box (<x1> <y1> <x2> <y2>)))
-        """
-        bottle = self.face_id_port.prepare()
-        bottle.clear()
-        
-        for face in state['known_faces']:
-            face_list = bottle.addList()
-            
-            # class
-            c = face_list.addList()
-            c.addString("class")
-            c.addString(face['name'])
-            
-            # score
-            s = face_list.addList()
-            s.addString("score")
-            s.addFloat64(face['confidence'])
-            
-            # box
-            b = face_list.addList()
-            b.addString("box")
-            box_list = b.addList()
-            for coord in face['box']:
-                box_list.addFloat64(coord)
-        
-        self.face_id_port.write()
-    
-    def _publish_va(self, state: Dict, valence: float, arousal: float):
-        """
-        Publish valence/arousal.
-        Format: "PersonName1" <valence1> <arousal1> "PersonName2" <valence2> <arousal2> ...
-        """
-        bottle = self.va_port.prepare()
-        bottle.clear()
-        
-        for face in state['known_faces']:
-            # Add person name as string
-            bottle.addString(face['name'])
-            # Add valence
-            bottle.addFloat64(valence)
-            # Add arousal
-            bottle.addFloat64(arousal)
-        
-        self.va_port.write()
-    
-    def _publish_actions(self, state: Dict):
-        """
-        Publish detected actions.
-        Format: (stamp <ts>) (people (((class <id>) (action <label>) (prob <conf>)) ...))
-        """
-        bottle = self.action_port.prepare()
-        bottle.clear()
-        
-        # stamp
-        stamp = bottle.addList()
-        stamp.addString("stamp")
-        stamp.addFloat64(time.time())
-        
-        # people
-        people = bottle.addList()
-        people.addString("people")
-        people_list = people.addList()
-        
-        for person_id, (action, prob) in state['detected_actions'].items():
-            person = people_list.addList()
-            
-            # class (person_id)
-            c = person.addList()
-            c.addString("class")
-            c.addString(str(person_id))
-            
-            # action
-            a = person.addList()
-            a.addString("action")
-            a.addString(action)
-            
-            # prob
-            p = person.addList()
-            p.addString("prob")
-            p.addFloat64(prob)
-        
-        self.action_port.write()
-    
-    def stop(self):
-        self._running = False
 
+    def publish_stt(self, text: str):
+        """Publish STT output."""
+        bottle = self.stt_port.prepare()
+        bottle.clear()
 
-# =============================================================================
-# Test Harness Main Controller
-# =============================================================================
+        # Format: [["text", "speaker"]]
+        outer = bottle.addList()
+        inner = outer.addList()
+        inner.addString(text)
+        inner.addString("user")
 
-class UnifiedTestHarness:
-    """
-    Main test harness controller.
-    Coordinates world state, data pump, RPC servers, and test scenarios.
-    """
-    
-    # Allowed actions for testing
-    ALLOWED_ACTIONS = [
-        "answer phone",
-        "carry/hold (an object)",
-        "drink",
-        "eat",
-        "text on/look at a cellphone",
-        "hand wave",
-    ]
-    
-    # Expected responses for actions
-    ACTION_RESPONSES = {
-        "answer phone": ("speech", "Salutalo da parte mia"),
-        "carry/hold (an object)": ("speech", "Tieni forte"),
-        "drink": ("speech", "Salute"),
-        "eat": ("speech", "Buon appetito"),
-        "text on/look at a cellphone": ("ao", "ao_yawn_phone"),
-        "hand wave": ("ao", "ao_wave"),
-    }
-    
-    def __init__(self):
-        """Initialize harness components."""
-        yarp.Network.init()
-        if not yarp.Network.checkNetwork():
-            print("YARP network not available!")
-            sys.exit(1)
-        
-        print("\n" + "="*80)
-        print("  UNIFIED TEST HARNESS FOR EMBODIED BEHAVIOUR")
-        print("="*80)
-        print("  Tests: State machine, BT paths, Q-learning, action responses")
-        print("  Press Ctrl+C anytime to stop")
-        print("="*80 + "\n")
-        
-        # Core components
-        self.world_state = WorldStateManager()
-        self.interaction_server = InteractionInterfaceServer(self.world_state)
-        self.speech_server = SpeechServer()
-        self.data_pump = DataPump(self.world_state)
-        
-        # Control
-        self._running = False
-        
-        # Q-table tracking
-        self.q_file = "./q_table.json"
-        self.initial_q = None
-        
-        # Test results tracking
-        self.test_results: List[TestResult] = []
-        
-        signal.signal(signal.SIGINT, self._signal_handler)
-    
-    def _signal_handler(self, sig, frame):
-        print("\n\n[Harness] 🛑 Interrupted")
-        self._running = False
-    
-    def setup(self, auto_connect: bool = True, wait_for_module: bool = True) -> bool:
-        """Set up all components."""
-        print("[Setup] 🔧 Initializing...")
-        
-        # Open ports
-        if not self.data_pump.open_ports():
-            return False
-        if not self.interaction_server.open():
-            return False
-        if not self.speech_server.open():
-            return False
-        
-        # Start servers
-        print("\n[Setup] 🚀 Starting RPC servers...")
-        self.interaction_server.start()
-        self.speech_server.start()
-        time.sleep(0.5)
-        
-        # Connect
-        if auto_connect:
-            if wait_for_module:
-                print("\n[Setup] ⏳ Waiting for embodied_behaviour module...")
-                print("         (Start it in another terminal if not running)")
-            
-            if not self.data_pump.connect_ports(timeout=30.0 if wait_for_module else 5.0):
-                if wait_for_module:
-                    print("\n❌ Failed to connect to module!")
-                    return False
-        
-        # Start data pump
-        print("\n[Setup] 🚀 Starting 20Hz data pump...")
-        self.data_pump.start()
-        time.sleep(0.5)
-        
-        # Snapshot initial Q-table
-        self._snapshot_q_table()
-        
-        self._running = True
-        
-        print("\n" + "="*80)
-        print("  ✅ Setup Complete")
-        print("="*80 + "\n")
-        
-        return True
-    
-    def cleanup(self):
-        """Clean up resources."""
-        print("\n[Cleanup] Shutting down...")
-        self._running = False
-        
-        self.data_pump.stop()
-        self.interaction_server.stop()
-        self.speech_server.stop()
-        
-        time.sleep(0.5)
-        self.data_pump.close_ports()
-        
-        print("[Cleanup] Done")
-    
-    def _wait_for_action(self, timeout: float = 20.0, min_actions: int = 1, ignore_state_commands: bool = True) -> bool:
-        """Wait for robot to perform action(s), return True if received.
-        
-        Args:
-            ignore_state_commands: If True, don't count ao_start/ao_stop as actions to wait for
-        """
-        start_time = time.time()
-        
-        # Get initial action count, excluding state commands if requested
-        if ignore_state_commands:
-            initial_commands = [c for c in self.interaction_server.get_commands() if c['action'] not in ['ao_start', 'ao_stop']]
-            initial_count = len(initial_commands)
-        else:
-            initial_count = self.interaction_server.get_action_count()
-        
-        print(f"[Wait] Expecting {min_actions} action(s), max wait {timeout:.0f}s...")
-        
-        while time.time() - start_time < timeout:
-            if ignore_state_commands:
-                # Count only non-state-machine commands
-                commands = [c for c in self.interaction_server.get_commands() if c['action'] not in ['ao_start', 'ao_stop']]
-                current_count = len(commands)
-            else:
-                current_count = self.interaction_server.get_action_count()
-            
-            if current_count >= initial_count + min_actions:
-                elapsed = time.time() - start_time
-                print(f"[Wait] Action(s) received after {elapsed:.1f}s")
-                return True
-            time.sleep(0.5)
-        
-        print(f"[Wait] Timeout waiting for actions")
-        return False
-    
-    def _wait_for_speech(self, timeout: float = 20.0, contains: str = None) -> bool:
-        """Wait for speech output, optionally checking content."""
-        start_time = time.time()
-        initial_count = len(self.speech_server.get_speech())
-        
-        print(f"[Wait] Expecting speech{f' containing "{contains}"' if contains else ''}, max wait {timeout:.0f}s...")
-        
-        while time.time() - start_time < timeout:
-            speeches = self.speech_server.get_speech()
-            if len(speeches) > initial_count:
-                if contains:
-                    for speech in speeches[initial_count:]:
-                        if contains.lower() in speech['text'].lower():
-                            elapsed = time.time() - start_time
-                            print(f"[Wait] Speech received after {elapsed:.1f}s")
-                            return True
-                else:
-                    elapsed = time.time() - start_time
-                    print(f"[Wait] Speech received after {elapsed:.1f}s")
-                    return True
-            time.sleep(0.5)
-        
-        print(f"[Wait] Timeout waiting for speech")
-        return False
-    
-    def _verify_scenario(self, scenario_name: str, expected: ExpectedOutcome) -> TestResult:
-        """Verify test scenario results against expectations."""
-        result = TestResult(
-            scenario_name=scenario_name,
-            status=TestStatus.PASS,
-            expected=expected,
-            elapsed_time=expected.max_wait_time
-        )
-        
-        # Collect actual results
-        result.actual_actions = [cmd['action'] for cmd in self.interaction_server.get_commands()]
-        result.actual_speech = [sp['text'] for sp in self.speech_server.get_speech()]
-        
-        # Verify actions
-        if expected.actions:
-            for exp_action in expected.actions:
-                if exp_action not in result.actual_actions:
-                    result.add_error(f"Expected action '{exp_action}' not received")
-        
-        if expected.min_actions > 0:
-            action_count = len([a for a in result.actual_actions if a and a.startswith('ao_')])
-            if action_count < expected.min_actions:
-                result.add_error(f"Expected >= {expected.min_actions} actions, got {action_count}")
-        
-        # Verify speech
-        if expected.speech_contains:
-            all_speech = ' '.join(result.actual_speech).lower()
-            for exp_text in expected.speech_contains:
-                if exp_text.lower() not in all_speech:
-                    result.add_error(f"Expected speech containing '{exp_text}' not found")
-        
-        # Verify Q-table updates
-        if expected.q_should_update:
-            current_q = self._get_q_table()
-            if self.initial_q and current_q:
-                for ctx in ['calm', 'lively']:
-                    for br in ['LP', 'HP']:
-                        old_val = self.initial_q.get(ctx, {}).get(br, 0)
-                        new_val = current_q.get(ctx, {}).get(br, 0)
-                        if abs(new_val - old_val) > 0.0001:
-                            result.q_changed = True
-                            break
+        self.stt_port.write()
+        self.log("INFO", f"Published STT: '{text}'")
+
+    def publish_tts_bookmark(self, value: int):
+        """Publish TTS bookmark (0=start, 1=end)."""
+        bottle = self.bookmark_port.prepare()
+        bottle.clear()
+        bottle.addInt32(value)
+        self.bookmark_port.write()
+        self.log("DEBUG", f"Published bookmark: {value}")
+
+    # ==================== Speech Receiver ====================
+
+    def _speech_receiver_loop(self):
+        """Receive and process TTS commands."""
+        while self._running:
+            bottle = self.speech_in_port.read(False)
+            if bottle and bottle.size() > 0:
+                text = bottle.get(0).asString()
+                self.log("INFO", f"Received TTS: '{text}'")
                 
-                if not result.q_changed:
-                    result.add_warning("Q-table did not update (action may not have completed)")
+                with self._lock:
+                    self.received_speech.append(text)
+
+                # Simulate TTS: send start, wait, send end
+                threading.Thread(
+                    target=self._simulate_tts_playback,
+                    args=(text,),
+                    daemon=True
+                ).start()
+
+            time.sleep(0.05)
+
+    def _simulate_tts_playback(self, text: str):
+        """Simulate TTS playback with bookmarks."""
+        # Estimate duration based on text length (rough: 10 chars/sec)
+        duration = max(0.5, len(text) / 10.0)
+        duration = min(duration, 3.0)  # Cap at 3 seconds
+
+        self.publish_tts_bookmark(0)  # Start
+        time.sleep(duration)
+        self.publish_tts_bookmark(1)  # End
+
+        # After TTS ends, check if we should send an STT response
+        time.sleep(0.5)  # Brief pause before "user speaks"
+        with self._lock:
+            if self.stt_queue:
+                response = self.stt_queue.pop(0)
+                self.publish_stt(response)
+
+    # ==================== RPC Handlers ====================
+
+    def _rpc_loop(self, port: yarp.RpcServer, handler: Callable):
+        """Generic RPC handling loop."""
+        while self._running:
+            cmd = yarp.Bottle()
+            reply = yarp.Bottle()
+            
+            if port.read(cmd, False):
+                handler(cmd, reply)
+                port.reply(reply)
+            
+            time.sleep(0.01)
+
+    def _handle_interaction_interface_rpc(self, cmd: yarp.Bottle, reply: yarp.Bottle):
+        """Handle /interactionInterface RPC commands."""
+        reply.clear()
+        
+        if cmd.size() < 1:
+            reply.addString("error")
+            reply.addString("Empty command")
+            return
+
+        command = cmd.get(0).asString()
+        self.log("INFO", f"interactionInterface RPC: {command}")
+
+        with self._lock:
+            self.rpc_logs.append({
+                "port": "interactionInterface",
+                "command": command,
+                "timestamp": datetime.now().isoformat()
+            })
+
+        # Handle common behaviour commands
+        if command in ("ao_wave", "ao_hi", "ao_idle", "ao_look"):
+            reply.addString("ok")
+            self.log("INFO", f"Executed behaviour: {command}")
+        elif command == "help":
+            reply.addString("ok")
+            reply.addString("Commands: ao_wave, ao_hi, ao_idle, ao_look")
+        else:
+            reply.addString("ok")  # Accept any command
+
+    def _handle_object_recognition_rpc(self, cmd: yarp.Bottle, reply: yarp.Bottle):
+        """Handle /objectRecognition/rpc commands."""
+        reply.clear()
+
+        if cmd.size() < 1:
+            reply.addString("error")
+            return
+
+        command = cmd.get(0).asString()
+        self.log("INFO", f"objectRecognition RPC: {cmd.toString()}")
+
+        with self._lock:
+            self.rpc_logs.append({
+                "port": "objectRecognition",
+                "command": cmd.toString(),
+                "timestamp": datetime.now().isoformat()
+            })
+
+        if command == "register":
+            # register <name> <track_id>
+            if cmd.size() >= 3:
+                name = cmd.get(1).asString()
+                track_id = cmd.get(2).asInt32()
+                
+                # Create mock face file
+                face_file = os.path.join(self.faces_dir, f"{name}.txt")
+                with open(face_file, 'w') as f:
+                    f.write(f"track_id={track_id}\nregistered={datetime.now().isoformat()}")
+                
+                self.log("INFO", f"Registered face: {name} (track_id={track_id})")
+                reply.addString("ok")
             else:
-                result.add_warning("Could not verify Q-table changes")
-        
-        return result
-    
-    def _snapshot_q_table(self):
-        """Snapshot Q-table for comparison."""
-        if os.path.exists(self.q_file):
-            try:
-                with open(self.q_file) as f:
-                    self.initial_q = json.load(f)
-            except:
-                self.initial_q = None
-    
-    def _get_q_table(self) -> Optional[Dict]:
-        """Get current Q-table."""
-        if os.path.exists(self.q_file):
-            try:
-                with open(self.q_file) as f:
-                    return json.load(f)
-            except:
-                return None
-        return None
-    
-    # =========================================================================
-    # Interactive Mode
-    # =========================================================================
-    
-    def run_interactive(self):
-        """Run interactive CLI."""
-        print("="*80)
-        print("  INTERACTIVE MODE")
-        print("="*80)
-        print("Type 'help' for commands\n")
-        
-        self._print_status()
-        
+                reply.addString("error")
+                reply.addString("Usage: register <name> <track_id>")
+        else:
+            reply.addString("ok")
+
+    def _handle_face_tracker_rpc(self, cmd: yarp.Bottle, reply: yarp.Bottle):
+        """Handle /faceTracker/rpc commands."""
+        reply.clear()
+
+        if cmd.size() < 1:
+            reply.addString("error")
+            return
+
+        command = cmd.get(0).asString()
+        self.log("INFO", f"faceTracker RPC: {cmd.toString()}")
+
+        with self._lock:
+            self.rpc_logs.append({
+                "port": "faceTracker",
+                "command": cmd.toString(),
+                "timestamp": datetime.now().isoformat()
+            })
+
+        if command == "track":
+            # track <name>
+            if cmd.size() >= 2:
+                target = cmd.get(1).asString()
+                self.log("INFO", f"Tracking face: {target}")
+            reply.addString("ok")
+        elif command == "stop":
+            self.log("INFO", "Stopped face tracking")
+            reply.addString("ok")
+        else:
+            reply.addString("ok")
+
+    def _handle_stt_rpc(self, cmd: yarp.Bottle, reply: yarp.Bottle):
+        """Handle /speech2text/rpc commands."""
+        reply.clear()
+
+        if cmd.size() < 1:
+            reply.addString("error")
+            return
+
+        command = cmd.get(0).asString()
+        self.log("INFO", f"speech2text RPC: {cmd.toString()}")
+
+        with self._lock:
+            self.rpc_logs.append({
+                "port": "speech2text",
+                "command": cmd.toString(),
+                "timestamp": datetime.now().isoformat()
+            })
+
+        if command == "set":
+            # set <language>
+            if cmd.size() >= 2:
+                lang = cmd.get(1).asString()
+                self.log("INFO", f"STT language set to: {lang}")
+            reply.addString("ok")
+        elif command == "start":
+            self.log("INFO", "STT started")
+            reply.addString("ok")
+        elif command == "stop":
+            self.log("INFO", "STT stopped")
+            reply.addString("ok")
+        else:
+            reply.addString("ok")
+
+    # ==================== Scenario Execution ====================
+
+    def set_faces(self, faces: List[SimulatedFace]):
+        """Set current faces in the scene."""
+        with self._lock:
+            self.current_faces = faces
+
+    def set_context(self, label: ContextLabel):
+        """Set current context label."""
+        self.current_context = label
+
+    def queue_stt_response(self, text: str):
+        """Queue an STT response to be sent after next TTS."""
+        with self._lock:
+            self.stt_queue.append(text)
+
+    def clear_stt_queue(self):
+        """Clear pending STT responses."""
+        with self._lock:
+            self.stt_queue.clear()
+
+    def run_scenario(self, scenario: Scenario):
+        """Execute a test scenario."""
+        self.log("INFO", f"{'='*60}")
+        self.log("INFO", f"Running scenario: {scenario.name}")
+        self.log("INFO", f"Description: {scenario.description}")
+        self.log("INFO", f"{'='*60}")
+
+        for i, step in enumerate(scenario.steps):
+            self.log("INFO", f"Step {i+1}/{len(scenario.steps)}: {step.description}")
+
+            # Set faces
+            self.set_faces(step.faces)
+
+            # Set context
+            self.set_context(step.context_label)
+
+            # Queue STT responses
+            for response in step.stt_responses:
+                self.queue_stt_response(response)
+
+            # Wait for step duration
+            time.sleep(step.duration)
+
+        self.log("INFO", f"Scenario '{scenario.name}' completed")
+        self.log("INFO", f"{'='*60}")
+
+    def run_all_scenarios(self, delay_between: float = 3.0):
+        """Run all predefined scenarios in sequence."""
+        scenarios = create_scenarios()
+
+        for name, scenario in scenarios.items():
+            self.run_scenario(scenario)
+            time.sleep(delay_between)
+
+    def run_interactive_mode(self):
+        """Run in interactive mode allowing manual control."""
+        self.log("INFO", "Interactive mode started")
+        self.log("INFO", "Commands: faces, context, stt, scenario, list, status, quit")
+
+        scenarios = create_scenarios()
+
         while self._running:
             try:
-                cmd = input("\n> ").strip()
-                if cmd:
-                    self._handle_command(cmd)
-            except EOFError:
+                cmd = input("\n[TestHarness]> ").strip().lower()
+
+                if not cmd:
+                    continue
+
+                parts = cmd.split()
+                command = parts[0]
+
+                if command == "quit" or command == "q":
+                    break
+
+                elif command == "list":
+                    print("\nAvailable scenarios:")
+                    for name, scen in scenarios.items():
+                        print(f"  {name}: {scen.description}")
+
+                elif command == "scenario" or command == "s":
+                    if len(parts) < 2:
+                        print("Usage: scenario <name>")
+                        continue
+                    name = parts[1]
+                    if name in scenarios:
+                        self.run_scenario(scenarios[name])
+                    else:
+                        print(f"Unknown scenario: {name}")
+
+                elif command == "faces":
+                    if len(parts) < 2:
+                        print("Usage: faces <count> OR faces clear")
+                        continue
+                    if parts[1] == "clear":
+                        self.set_faces([])
+                        print("Cleared all faces")
+                    else:
+                        count = int(parts[1])
+                        faces = []
+                        for i in range(count):
+                            faces.append(SimulatedFace(
+                                face_id=f"person_{i}" if random.random() > 0.5 else "unknown",
+                                track_id=100 + i,
+                                bbox=(100 + i * 150, 100, 100, 120),
+                                zone=random.choice(list(Zone)),
+                                distance=random.choice(list(Distance)),
+                                attention=random.choice(list(Attention)),
+                                time_in_view=random.uniform(1.0, 20.0)
+                            ))
+                        self.set_faces(faces)
+                        print(f"Added {count} random faces")
+
+                elif command == "context" or command == "c":
+                    if len(parts) < 2:
+                        print("Usage: context calm|lively|uncertain")
+                        continue
+                    label = parts[1]
+                    if label == "calm":
+                        self.set_context(ContextLabel.CALM)
+                    elif label == "lively":
+                        self.set_context(ContextLabel.LIVELY)
+                    elif label == "uncertain":
+                        self.set_context(ContextLabel.UNCERTAIN)
+                    else:
+                        print("Invalid context. Use: calm, lively, uncertain")
+                        continue
+                    print(f"Context set to: {label}")
+
+                elif command == "stt":
+                    if len(parts) < 2:
+                        print("Usage: stt <text to send>")
+                        continue
+                    text = " ".join(parts[1:])
+                    self.publish_stt(text)
+
+                elif command == "status":
+                    with self._lock:
+                        print(f"\nCurrent state:")
+                        print(f"  Faces: {len(self.current_faces)}")
+                        for f in self.current_faces:
+                            print(f"    - {f.face_id} (track={f.track_id}, zone={f.zone.value}, " +
+                                  f"dist={f.distance.value}, attn={f.attention.value})")
+                        print(f"  Context: {self.current_context.name}")
+                        print(f"  STT queue: {len(self.stt_queue)} messages")
+                        print(f"  Received TTS: {len(self.received_speech)} messages")
+                        print(f"  RPC logs: {len(self.rpc_logs)} calls")
+
+                elif command == "help" or command == "h":
+                    print("\nCommands:")
+                    print("  list              - List available scenarios")
+                    print("  scenario <name>   - Run a specific scenario")
+                    print("  faces <count>     - Add random faces")
+                    print("  faces clear       - Remove all faces")
+                    print("  context <label>   - Set context (calm/lively/uncertain)")
+                    print("  stt <text>        - Send STT output")
+                    print("  status            - Show current state")
+                    print("  quit              - Exit")
+
+                else:
+                    print(f"Unknown command: {command}. Type 'help' for commands.")
+
+            except KeyboardInterrupt:
                 break
             except Exception as e:
                 print(f"Error: {e}")
-        
-        print("\nExiting interactive mode...")
-    
-    def _handle_command(self, cmd: str):
-        """Handle interactive command."""
-        parts = cmd.split()
-        if not parts:
+
+
+# ==================== Continuous Publishing Mode ====================
+
+def run_continuous_mode(harness: TestHarness, scenario_name: Optional[str] = None):
+    """Run continuous publishing with cycling scenarios."""
+    scenarios = create_scenarios()
+
+    if scenario_name:
+        if scenario_name not in scenarios:
+            print(f"Unknown scenario: {scenario_name}")
+            print(f"Available: {', '.join(scenarios.keys())}")
             return
-        
-        action = parts[0].lower()
-        args = parts[1:]
-        
-        # Face management
-        if action == "person" and len(args) >= 2:
-            name = args[0]
-            conf = float(args[1])
-            x1, y1 = random.randint(100, 200), random.randint(100, 200)
-            size = random.randint(150, 300)
-            self.world_state.add_face(name, conf, [x1, y1, x1+size, y1+size])
-            print(f"✅ Added {name} (conf={conf:.2f}, box_size={size})")
-        
-        elif action == "faces" and len(args) >= 1:
-            count = int(args[0])
-            self.world_state.set_faces_count(count)
-            print(f"✅ Set faces count to {count} (unknown faces)")
-        
-        elif action == "clear":
-            self.world_state.clear_faces()
-            self.world_state.clear_actions()
-            print("✅ Cleared all faces and actions")
-        
-        # Context
-        elif action == "context" and len(args) >= 1:
-            label = int(args[0])
-            if label in [-1, 0, 1]:
-                names = {-1: "uncertain", 0: "calm", 1: "lively"}
-                self.world_state.update_state(context_label=label)
-                print(f"✅ Context = {label} ({names[label]})")
-        
-        # VA
-        elif action == "va" and len(args) >= 2:
-            v, a = float(args[0]), float(args[1])
-            self.world_state.update_state(valence=v, arousal=a)
-            print(f"✅ V={v:.2f}, A={a:.2f}")
-        
-        # Actions
-        elif action == "action" and len(args) >= 2:
-            pid = args[0]
-            act = " ".join(args[1:])
-            self.world_state.set_action(pid, act, 0.9)
-            print(f"✅ Person {pid} action: {act}")
-        
-        elif action == "clearactions":
-            self.world_state.clear_actions()
-            print("✅ Cleared actions")
-        
-        # Scenarios
-        elif action.startswith("scenario") or action.startswith("test"):
-            scenario_map = {
-                "scenario1": self._scenario_lp_new_person,
-                "test1": self._scenario_lp_new_person,
-                "scenario2": self._scenario_lp_action_response,
-                "test2": self._scenario_lp_action_response,
-                "scenario3": self._scenario_hp_no_known,
-                "test3": self._scenario_hp_no_known,
-                "scenario4": self._scenario_hp_new_person,
-                "test4": self._scenario_hp_new_person,
-                "scenario5": self._scenario_state_transitions,
-                "test5": self._scenario_state_transitions,
-                "scenario6": self._scenario_learning_test,
-                "test6": self._scenario_learning_test,
-                "scenario7": self._scenario_multi_person,
-                "test7": self._scenario_multi_person,
-            }
-            if action in scenario_map:
-                scenario_map[action]()
-            else:
-                print(f"Unknown scenario. Available: scenario1-7 or test1-7")
-        
-        # Monitoring
-        elif action == "status":
-            self._print_status()
-        
-        elif action == "log":
-            self._print_logs()
-        
-        elif action == "q":
-            self._print_q_table()
-        
-        elif action == "clearlog":
-            self.interaction_server.clear_commands()
-            self.speech_server.clear_speech()
-            print("✅ Cleared logs")
-        
-        # Help
-        elif action == "help":
-            self._print_help()
-        
-        elif action in ["quit", "exit"]:
-            self._running = False
-        
-        else:
-            print(f"Unknown: {action}. Type 'help'")
-    
-    def _print_help(self):
-        print("""
-══════════════════════════════════════════════════════════════════════
-  COMMANDS
-══════════════════════════════════════════════════════════════════════
+        scenario_list = [scenarios[scenario_name]]
+    else:
+        scenario_list = list(scenarios.values())
 
-👤 FACES:
-  person <name> <conf>     Add known person (e.g., person Mario 0.95)
-  faces <n>                Set face count (unknown faces)
-  clear                    Remove all faces
+    print(f"\nContinuous mode: cycling through {len(scenario_list)} scenario(s)")
+    print("Press Ctrl+C to stop\n")
 
-🌍 ENVIRONMENT:
-  context <-1|0|1>         Set context (uncertain/calm/lively)
-  va <v> <a>               Set valence/arousal
-
-🎬 ACTIONS:
-  action <id> <action>     Trigger action (e.g., action 0 hand wave)
-  clearactions             Clear detected actions
-
-🧪 SCENARIOS:
-  scenario1 / test1        LP: New person greeting
-  scenario2 / test2        LP: Action response  
-  scenario3 / test3        HP: No known person (wave only)
-  scenario4 / test4        HP: New person greeting
-  scenario5 / test5        State transitions test
-  scenario6 / test6        Learning validation
-  scenario7 / test7        Multi-person target selection
-
-📊 MONITORING:
-  status                   Show world state
-  log                      Show received commands/speech
-  q                        Show Q-table
-  clearlog                 Clear logs
-
-❓ OTHER:
-  help                     This help
-  quit                     Exit
-══════════════════════════════════════════════════════════════════════
-""")
-    
-    def _print_status(self):
-        state = self.world_state.get_state()
-        ctx_names = {-1: "uncertain", 0: "calm", 1: "lively"}
-        
-        print(f"""
-──────────────────────────────────────────────────────────────────────
-  CURRENT STATE
-──────────────────────────────────────────────────────────────────────
-  👥 Faces:        {state['faces_count']}
-  🌍 Context:      {state['context_label']} ({ctx_names.get(state['context_label'], '?')})
-  😊 Valence:      {state['valence']:.2f}
-  ⚡ Arousal:      {state['arousal']:.2f}
-  🧑 Known:        {[f['name'] for f in state['known_faces']] or '(none)'}
-  🎬 Actions:      {state['detected_actions'] or '(none)'}
-  📈 Robot Acts:   {self.interaction_server.get_action_count()}
-──────────────────────────────────────────────────────────────────────""")
-    
-    def _print_logs(self):
-        print("\n" + "─"*70)
-        print("  INTERACTION COMMANDS")
-        print("─"*70)
-        for cmd in self.interaction_server.get_commands()[-10:]:
-            print(f"  [{cmd['time']}] {cmd['action'] or cmd['raw']}")
-        if not self.interaction_server.get_commands():
-            print("  (none)")
-        
-        print("\n" + "─"*70)
-        print("  SPEECH OUTPUT")
-        print("─"*70)
-        for sp in self.speech_server.get_speech()[-10:]:
-            print(f"  [{sp['time']}] {sp['text']}")
-        if not self.speech_server.get_speech():
-            print("  (none)")
-        print("─"*70)
-    
-    def _print_q_table(self):
-        q = self._get_q_table()
-        if q:
-            print(f"""
-──────────────────────────────────────────────────────────────────────
-  Q-TABLE
-──────────────────────────────────────────────────────────────────────
-  calm:   LP={q.get('calm',{}).get('LP',0):.4f}  HP={q.get('calm',{}).get('HP',0):.4f}
-  lively: LP={q.get('lively',{}).get('LP',0):.4f}  HP={q.get('lively',{}).get('HP',0):.4f}
-  epsilon: {q.get('epsilon', 0.8):.2f}
-──────────────────────────────────────────────────────────────────────""")
-            
-            if self.initial_q:
-                print("  Changes from start:")
-                for ctx in ['calm', 'lively']:
-                    for br in ['LP', 'HP']:
-                        old = self.initial_q.get(ctx, {}).get(br, 0)
-                        new = q.get(ctx, {}).get(br, 0)
-                        if abs(new - old) > 0.0001:
-                            print(f"    {ctx}/{br}: {old:.4f} → {new:.4f} (Δ{new-old:+.4f})")
-                eps_old = self.initial_q.get('epsilon', 0.8)
-                eps_new = q.get('epsilon', 0.8)
-                if abs(eps_new - eps_old) > 0.0001:
-                    print(f"    epsilon: {eps_old:.2f} → {eps_new:.2f}")
-        else:
-            print("  (Q-table not found)")
-    
-    # =========================================================================
-    # Test Scenarios
-    # =========================================================================
-    
-    def _scenario_lp_new_person(self):
-        """
-        Scenario 1: LP Path - New Person Greeting
-        Requires: close face (large box), known person, NOT greeted today
-        Expected: Greet + wave, learning update
-        """
-        print("""
-══════════════════════════════════════════════════════════════════════
-  SCENARIO 1: LP - New Person Greeting
-══════════════════════════════════════════════════════════════════════
-  Path: CloseFace OK → KnownPerson OK → GreetedToday NO → Greet+Wave
-  Expected: "Ciao <name>" speech + ao_wave command
-  Note: LP requires large face box (close proximity), not mutual gaze
-══════════════════════════════════════════════════════════════════════
-""")
-        # Setup
-        self.world_state.clear_faces()
-        self.world_state.clear_actions()
-        self.interaction_server.clear_commands()
-        self.speech_server.clear_speech()
-        
-        # Define expected outcome
-        expected = ExpectedOutcome(
-            speech_contains=["ciao"],
-            actions=["ao_wave"],
-            min_actions=1,
-            max_wait_time=18.0,
-            q_should_update=True,
-            description="LP greeting path with close face (large box)"
-        )
-        
-        start_time = time.time()
-        
-        # Calm context (tends to select LP)
-        print("[Setup] Setting calm context...")
-        self.world_state.update_state(context_label=0)
-        time.sleep(2)  # Allow module to process context
-        
-        # Add person with LARGE box (close proximity for LP)
-        name = f"TestPerson_{random.randint(100,999)}"
-        print(f"[Setup] Adding '{name}' with LARGE bounding box (close proximity)...")
-        # Large box = 300x400 pixels (area = 120,000 > threshold of 15,000)
-        self.world_state.add_face(name, 0.95, [100, 100, 400, 500])
-        self.world_state.update_state(valence=0.6, arousal=0.4)
-        
-        # Wait for response with verification
-        if not self._wait_for_action(timeout=expected.max_wait_time, min_actions=1):
-            print("[Result] No action received within timeout")
-        
-        # Give extra time for learning update
-        time.sleep(2)
-        
-        # Verify results
-        expected.elapsed_time = time.time() - start_time
-        result = self._verify_scenario("LP New Person Greeting", expected)
-        result.print_summary()
-        self.test_results.append(result)
-    
-    def _scenario_lp_action_response(self):
-        """
-        Scenario 2: LP Path - Action Response
-        Requires: close face (large box), known person, greeted today, action detected
-        Expected: Appropriate response to action
-        """
-        print("""
-══════════════════════════════════════════════════════════════════════
-  SCENARIO 2: LP - Action Response
-══════════════════════════════════════════════════════════════════════
-  Path: CloseFace OK → KnownPerson OK → GreetedToday OK → ActionDetected OK
-  Expected: Response based on action type
-  Note: LP requires large face box (close proximity)
-══════════════════════════════════════════════════════════════════════
-""")
-        print("  NOTE: Run scenario1 first to mark person as greeted today\n")
-        
-        self.world_state.clear_actions()
-        self.interaction_server.clear_commands()
-        self.speech_server.clear_speech()
-        
-        # Select random action
-        action = random.choice(["hand wave", "drink", "eat"])
-        expected_response = self.ACTION_RESPONSES.get(action)
-        
-        expected = ExpectedOutcome(
-            min_actions=1,
-            max_wait_time=15.0,
-            description=f"LP action response to '{action}'"
-        )
-        
-        if expected_response:
-            resp_type, resp_value = expected_response
-            if resp_type == "speech":
-                expected.speech_contains = [resp_value]
-            elif resp_type == "ao":
-                expected.actions = [resp_value]
-        
-        start_time = time.time()
-        
-        # Ensure calm context
-        self.world_state.update_state(context_label=0)
-        
-        # Ensure face with LARGE box (close proximity)
-        state = self.world_state.get_state()
-        if not state['known_faces']:
-            print("[Setup] Adding known person with LARGE box...")
-            # Large box = 300x400 pixels (area = 120,000 > threshold of 15,000)
-            self.world_state.add_face("Mario", 0.95, [100, 100, 400, 500])
-        
-        print("[Setup] Waiting 3s for module to see state...")
-        time.sleep(3)
-        
-        # Trigger action
-        print(f"[Setup] Triggering action: '{action}'")
-        self.world_state.set_action("0", action, 0.92)
-        
-        # Wait for response
-        if not self._wait_for_action(timeout=expected.max_wait_time, min_actions=1):
-            print("[Result] No response received within timeout")
-        
-        time.sleep(1)  # Allow final processing
-        
-        # Verify results
-        expected.elapsed_time = time.time() - start_time
-        result = self._verify_scenario("LP Action Response", expected)
-        if expected_response:
-            print(f"\nExpected response for '{action}': {expected_response}")
-        result.print_summary()
-        self.test_results.append(result)
-    
-    def _scenario_hp_no_known(self):
-        """
-        Scenario 3: HP Path - No Known Person
-        Requires: no known faces (but faces > 0)
-        Expected: Wave only (no greeting)
-        """
-        print("""
-══════════════════════════════════════════════════════════════════════
-  SCENARIO 3: HP - No Known Person (Wave Only)
-══════════════════════════════════════════════════════════════════════
-  Path: KnownPerson NO → Wave Only
-  Expected: ao_wave command (no speech)
-══════════════════════════════════════════════════════════════════════
-""")
-        self.world_state.clear_faces()
-        self.world_state.clear_actions()
-        self.interaction_server.clear_commands()
-        self.speech_server.clear_speech()
-        
-        expected = ExpectedOutcome(
-            actions=["ao_wave"],
-            min_actions=1,
-            max_wait_time=18.0,
-            q_should_update=True,
-            description="HP wave-only path (no known person)"
-        )
-        
-        start_time = time.time()
-        
-        # Lively context (tends to select HP)
-        print("[Setup] Setting lively context...")
-        self.world_state.update_state(context_label=1)
-        time.sleep(2)
-        
-        # Set faces but no known (just count)
-        print("[Setup] Setting 1 unknown face...")
-        self.world_state.set_faces_count(1)
-        self.world_state.update_state(valence=0.5, arousal=0.5)
-        
-        # Wait for response
-        if not self._wait_for_action(timeout=expected.max_wait_time, min_actions=1):
-            print("[Result] No action received within timeout")
-        
-        time.sleep(2)
-        
-        # Verify results
-        expected.elapsed_time = time.time() - start_time
-        result = self._verify_scenario("HP Wave Only", expected)
-        
-        # Additional check: should NOT have greeting speech
-        if result.actual_speech:
-            result.add_warning(f"Unexpected speech received: {result.actual_speech}")
-        
-        result.print_summary()
-        self.test_results.append(result)
-    
-    def _scenario_hp_new_person(self):
-        """
-        Scenario 4: HP Path - New Person Greeting
-        Requires: known person, NOT greeted today (no mutual gaze needed)
-        Expected: Greet + wave
-        """
-        print("""
-══════════════════════════════════════════════════════════════════════
-  SCENARIO 4: HP - New Person Greeting
-══════════════════════════════════════════════════════════════════════
-  Path: KnownPerson OK → GreetedToday NO → Greet+Wave
-  Expected: "Ciao <name>" + ao_wave (HP has no close-face requirement)
-══════════════════════════════════════════════════════════════════════
-""")
-        self.world_state.clear_faces()
-        self.world_state.clear_actions()
-        self.interaction_server.clear_commands()
-        self.speech_server.clear_speech()
-        
-        expected = ExpectedOutcome(
-            speech_contains=["ciao"],
-            actions=["ao_wave"],
-            min_actions=1,
-            max_wait_time=18.0,
-            q_should_update=True,
-            description="HP greeting path"
-        )
-        
-        start_time = time.time()
-        
-        # Lively context
-        print("[Setup] Setting lively context...")
-        self.world_state.update_state(context_label=1)
-        time.sleep(2)
-        
-        # Add known person (HP doesn't need close face)
-        name = f"Luigi_{random.randint(100,999)}"
-        print(f"[Setup] Adding '{name}'...")
-        self.world_state.add_face(name, 0.92, [150, 100, 400, 420])
-        self.world_state.update_state(valence=0.55, arousal=0.45)
-        
-        # Wait for response
-        if not self._wait_for_action(timeout=expected.max_wait_time, min_actions=1):
-            print("[Result] No action received within timeout")
-        
-        time.sleep(2)
-        
-        # Verify results
-        expected.elapsed_time = time.time() - start_time
-        result = self._verify_scenario("HP New Person Greeting", expected)
-        result.print_summary()
-        self.test_results.append(result)
-    
-    def _scenario_state_transitions(self):
-        """
-        Scenario 5: Test ACTIVE/INACTIVE transitions
-        Comprehensive test of state machine and ao_start/ao_stop
-        """
-        print("""
-══════════════════════════════════════════════════════════════════════
-  SCENARIO 5: State Transitions (Complete)
-══════════════════════════════════════════════════════════════════════
-  Tests: Full state machine with ao_start, ao_stop, and tree selection
-  Duration: ~70 seconds (includes 60s INACTIVE timeout)
-══════════════════════════════════════════════════════════════════════
-""")
-        self.interaction_server.clear_commands()
-        self.speech_server.clear_speech()
-        
-        expected = ExpectedOutcome(
-            actions=["ao_start", "ao_stop"],
-            min_actions=2,
-            max_wait_time=75.0,
-            description="Complete state machine test"
-        )
-        
-        start_time = time.time()
-        
-        # Phase 1: Ensure INACTIVE state
-        print("\n[Phase 1] Ensuring INACTIVE state...")
-        self.world_state.clear_faces()
-        self.world_state.clear_actions()
-        time.sleep(3)
-        
-        # Phase 2: Test INACTIVE → ACTIVE (ao_start)
-        print("\n[Phase 2] Testing INACTIVE → ACTIVE transition...")
-        print("[Action] Adding face → expect ao_start...")
-        self.world_state.add_face("StateTest", 0.9, [100, 100, 300, 300])
-        self.world_state.update_state(context_label=0)
-        
-        if self._wait_for_action(timeout=8.0, min_actions=1):
-            cmds = [c['action'] for c in self.interaction_server.get_commands()]
-            if 'ao_start' in cmds:
-                print("[Result] PASS: ao_start received")
-            else:
-                print(f"[Result] FAIL: Expected ao_start, got {cmds}")
-        else:
-            print("[Result] FAIL: No ao_start within 8s")
-        
-        # Phase 3: Verify tree selection happens in ACTIVE state
-        print("\n[Phase 3] Verifying tree selection in ACTIVE state...")
-        print("[Action] Waiting 10s for tree selection and greeting...")
-        time.sleep(10)
-        
-        speech_count = len(self.speech_server.get_speech())
-        action_count = self.interaction_server.get_action_count()
-        
-        if speech_count > 0 or action_count > 1:  # More than just ao_start
-            print(f"[Result] PASS: Tree selection active (speech={speech_count}, actions={action_count})")
-        else:
-            print(f"[Result] WARN: No tree selection detected (speech={speech_count}, actions={action_count})")
-        
-        # Phase 4: Test ACTIVE → INACTIVE (ao_stop after 60s)
-        print("\n[Phase 4] Testing ACTIVE → INACTIVE transition...")
-        print("[Action] Removing all faces → wait 60s for ao_stop...")
-        self.world_state.clear_faces()
-        
-        # Wait 65 seconds for the 60s timeout + processing
-        print("[Wait] This will take ~65 seconds...")
-        for remaining in range(65, 0, -5):
-            print(f"       {remaining}s remaining...")
-            time.sleep(5)
-        
-        # Check for ao_stop
-        print("\n[Check] Looking for ao_stop...")
-        cmds = [c['action'] for c in self.interaction_server.get_commands()]
-        if 'ao_stop' in cmds:
-            print("[Result] PASS: ao_stop received after 60s timeout")
-        else:
-            print(f"[Result] FAIL: ao_stop not found. All commands: {cmds}")
-        
-        # Phase 5: Verify tree selection stops in INACTIVE state
-        print("\n[Phase 5] Verifying no tree selection in INACTIVE state...")
-        print("[Action] Adding face again (should NOT trigger greeting in INACTIVE)...")
-        initial_action_count = self.interaction_server.get_action_count()
-        self.world_state.add_face("InactiveTest", 0.9, [100, 100, 300, 300])
-        self.world_state.update_state(context_label=0)
-        time.sleep(8)
-        
-        new_action_count = self.interaction_server.get_action_count()
-        if new_action_count == initial_action_count:
-            print("[Result] PASS: No tree execution in INACTIVE state")
-        else:
-            print(f"[Result] FAIL: Tree executed in INACTIVE state (actions: {new_action_count - initial_action_count})")
-        
-        # Verify and summarize
-        expected.elapsed_time = time.time() - start_time
-        result = self._verify_scenario("State Machine Complete Test", expected)
-        
-        # Additional checks
-        if 'ao_start' not in cmds:
-            result.add_error("ao_start was not received")
-        if 'ao_stop' not in cmds:
-            result.add_error("ao_stop was not received after 60s")
-        
-        result.print_summary()
-        self.test_results.append(result)
-        
-        print("\n[Summary] State machine test complete")
-        print(f"          Total duration: {expected.elapsed_time:.1f}s")
-        print(f"          Commands received: {len(cmds)}")
-    
-    def _scenario_learning_test(self):
-        """
-        Scenario 6: Validate Q-learning updates
-        """
-        print("""
-══════════════════════════════════════════════════════════════════════
-  SCENARIO 6: Learning Validation
-══════════════════════════════════════════════════════════════════════
-  Tests: Q-table updates and epsilon decay after actions
-══════════════════════════════════════════════════════════════════════
-""")
-        # Snapshot Q before
-        q_before = self._get_q_table()
-        if q_before:
-            eps_before = q_before.get('epsilon', 0.8)
-            print(f"[Before] Epsilon: {eps_before:.2f}")
-            print(f"         Q[calm]:   LP={q_before['calm']['LP']:.4f} HP={q_before['calm']['HP']:.4f}")
-            print(f"         Q[lively]: LP={q_before['lively']['LP']:.4f} HP={q_before['lively']['HP']:.4f}")
-        
-        expected = ExpectedOutcome(
-            speech_contains=["ciao"],
-            actions=["ao_wave"],
-            min_actions=1,
-            max_wait_time=18.0,
-            q_should_update=True,
-            description="Learning update validation"
-        )
-        
-        start_time = time.time()
-        
-        # Run a quick scenario to trigger learning
-        print("\n[Test] Running greeting scenario to trigger learning...")
-        self.world_state.clear_faces()
-        self.world_state.clear_actions()
-        self.interaction_server.clear_commands()
-        self.speech_server.clear_speech()
-        
-        self.world_state.update_state(context_label=0)  # calm
-        time.sleep(2)
-        
-        name = f"LearnTest_{random.randint(100,999)}"
-        self.world_state.add_face(name, 0.95, [100, 100, 400, 500])
-        self.world_state.update_state(valence=0.7, arousal=0.5)
-        
-        if not self._wait_for_action(timeout=expected.max_wait_time, min_actions=1):
-            print("[Result] No action received within timeout")
-        
-        time.sleep(2)  # Allow Q-table write
-        
-        # Check Q after
-        q_after = self._get_q_table()
-        expected.elapsed_time = time.time() - start_time
-        result = self._verify_scenario("Learning Validation", expected)
-        
-        if q_after and q_before:
-            eps_after = q_after.get('epsilon', 0.8)
-            print(f"\n[After] Epsilon: {eps_after:.2f} (Delta {eps_after-eps_before:+.2f})")
-            
-            for ctx in ['calm', 'lively']:
-                for br in ['LP', 'HP']:
-                    old = q_before[ctx][br]
-                    new = q_after[ctx][br]
-                    if abs(new - old) > 0.0001:
-                        print(f"        Q[{ctx}][{br}]: {old:.4f} → {new:.4f} (Delta {new-old:+.4f})")
-        
-        result.print_summary()
-        self.test_results.append(result)
-    
-    def _scenario_multi_person(self):
-        """
-        Scenario 7: Multi-person target selection (biggest box)
-        """
-        print("""
-══════════════════════════════════════════════════════════════════════
-  SCENARIO 7: Multi-Person Target Selection
-══════════════════════════════════════════════════════════════════════
-  Tests: Module selects person with biggest bounding box
-══════════════════════════════════════════════════════════════════════
-""")
-        self.world_state.clear_faces()
-        self.world_state.clear_actions()
-        self.interaction_server.clear_commands()
-        self.speech_server.clear_speech()
-        
-        expected = ExpectedOutcome(
-            speech_contains=["BigPerson"],
-            actions=["ao_wave"],
-            min_actions=1,
-            max_wait_time=18.0,
-            description="Multi-person target selection (biggest box)"
-        )
-        
-        start_time = time.time()
-        
-        self.world_state.update_state(context_label=0)
-        time.sleep(2)
-        
-        # Add 3 people with different box sizes
-        print("[Setup] Adding 3 people with different box sizes:")
-        self.world_state.add_face("SmallPerson", 0.9, [100, 100, 200, 200])  # 100x100
-        print("        SmallPerson: 100x100 box")
-        self.world_state.add_face("BigPerson", 0.95, [250, 100, 550, 500])   # 300x400
-        print("        BigPerson: 300x400 box (LARGEST)")
-        self.world_state.add_face("MediumPerson", 0.88, [600, 100, 800, 350])  # 200x250
-        print("        MediumPerson: 200x250 box")
-        
-        self.world_state.update_state(valence=0.6, arousal=0.4)
-        
-        print("\n[Expected] Module should greet 'BigPerson' (largest box)")
-        
-        if not self._wait_for_speech(timeout=expected.max_wait_time, contains="BigPerson"):
-            print("[Result] BigPerson not mentioned in speech within timeout")
-        
-        time.sleep(2)
-        
-        # Verify results
-        expected.elapsed_time = time.time() - start_time
-        result = self._verify_scenario("Multi-Person Selection", expected)
-        
-        # Check if BigPerson was greeted
-        if any("BigPerson" in s for s in result.actual_speech):
-            print("\n[Verification] BigPerson was correctly selected!")
-        else:
-            result.add_error("BigPerson was not greeted (should select largest box)")
-        
-        result.print_summary()
-        self.test_results.append(result)
-    
-    # =========================================================================
-    # Auto-Run Mode
-    # =========================================================================
-    
-    def run_auto_scenarios(self, duration_minutes: float):
-        """Run automated scenarios for specified duration."""
-        print(f"""
-══════════════════════════════════════════════════════════════════════
-  AUTO-RUN MODE
-══════════════════════════════════════════════════════════════════════
-  Duration: {duration_minutes:.1f} minutes
-  Will cycle through comprehensive test scenarios
-══════════════════════════════════════════════════════════════════════
-""")
-        start_time = time.time()
-        end_time = start_time + (duration_minutes * 60)
-        scenario_count = 0
-        
-        # Snapshot initial Q
-        self._snapshot_q_table()
-        
-        scenarios = [
-            ("LP: New Person Greeting", self._auto_lp_greet),
-            ("LP: Action Response", self._auto_lp_action),
-            ("HP: Wave Only", self._auto_hp_wave),
-            ("HP: New Person Greeting", self._auto_hp_greet),
-            ("State Machine Test", self._auto_state_machine),
-            ("Context Switch", self._auto_context_switch),
-            ("High Valence Interaction", self._auto_high_valence),
-            ("Low Valence Interaction", self._auto_low_valence),
-        ]
-        
-        scenario_idx = 0
-        
-        while time.time() < end_time and self._running:
-            scenario_count += 1
-            name, func = scenarios[scenario_idx % len(scenarios)]
-            
-            elapsed = (time.time() - start_time) / 60
-            remaining = (end_time - time.time()) / 60
-            
-            print(f"\n{'═'*70}")
-            print(f"  AUTO #{scenario_count}: {name}")
-            print(f"  Elapsed: {elapsed:.1f}m | Remaining: {remaining:.1f}m")
-            print(f"{'═'*70}")
-            
-            try:
-                func()
-            except Exception as e:
-                print(f"[Auto] Error: {e}")
-            
-            scenario_idx += 1
-            
-            if time.time() < end_time and self._running:
-                print(f"\n[Auto] Cooldown 5s...")
-                time.sleep(5)
-        
-        # Final summary
-        total_time = (time.time() - start_time) / 60
-        action_count = self.interaction_server.get_action_count()
-        
-        # Count test results
-        passed = sum(1 for r in self.test_results if r.status == TestStatus.PASS)
-        failed = sum(1 for r in self.test_results if r.status == TestStatus.FAIL)
-        partial = sum(1 for r in self.test_results if r.status == TestStatus.PARTIAL)
-        
-        print(f"""
-══════════════════════════════════════════════════════════════════════
-  AUTO-RUN COMPLETE
-══════════════════════════════════════════════════════════════════════
-  Duration:        {total_time:.1f} minutes
-  Scenarios:       {scenario_count}
-  Robot Actions:   {action_count}
-  Action Rate:     {action_count/max(0.1,total_time):.1f} per minute
-  
-  Test Results:    {passed} PASS, {failed} FAIL, {partial} WARN
-══════════════════════════════════════════════════════════════════════
-""")
-        
-        # Show Q-table changes
-        self._print_q_table()
-        
-        # Show summary of failures
-        if failed > 0 or partial > 0:
-            print("\n" + "="*70)
-            print("  ISSUES DETECTED")
-            print("="*70)
-            for result in self.test_results:
-                if result.status in [TestStatus.FAIL, TestStatus.PARTIAL]:
-                    print(f"\n[{result.status.value}] {result.scenario_name}")
-                    for err in result.errors:
-                        print(f"  Error: {err}")
-                    for warn in result.warnings:
-                        print(f"  Warning: {warn}")
-        
-        print("\n[Summary] Test harness stopped")
-    
-    def _auto_lp_greet(self):
-        """Auto: LP greeting scenario with verification."""
-        self.world_state.clear_faces()
-        self.world_state.clear_actions()
-        self.interaction_server.clear_commands()
-        self.speech_server.clear_speech()
-        
-        expected = ExpectedOutcome(
-            speech_contains=["ciao"],
-            actions=["ao_wave"],
-            min_actions=1,
-            max_wait_time=25.0,  # Increased for ao_start + greeting time
-            description="Auto LP greeting"
-        )
-        
-        start_time = time.time()
-        self.world_state.update_state(context_label=0)  # calm → LP
-        time.sleep(1.5)
-        
-        name = f"Auto_{random.randint(1000,9999)}"
-        print(f"[Auto] Adding '{name}' with large face box (LP path)")
-        self.world_state.add_face(name, random.uniform(0.88, 0.98), [100, 100, 400, 500])
-        self.world_state.update_state(
-            valence=random.uniform(0.5, 0.8),
-            arousal=random.uniform(0.3, 0.6)
-        )
-        
-        self._wait_for_action(timeout=expected.max_wait_time, min_actions=1)
-        time.sleep(1)
-        
-        expected.elapsed_time = time.time() - start_time
-        result = self._verify_scenario("Auto LP Greeting", expected)
-        if result.status == TestStatus.FAIL:
-            result.print_summary()
-        self.test_results.append(result)
-    
-    def _auto_lp_action(self):
-        """Auto: LP action response with verification.
-        
-        Action response requires:
-        - Person already greeted today (so tree waits for action)
-        - Action detected for that person
-        - LP tree selected with mutual gaze
-        
-        Note: This test works best AFTER a greeting test (person already greeted).
-        """
-        # Don't clear faces - we need the existing person who was greeted
-        self.world_state.clear_actions()
-        self.interaction_server.clear_commands()
-        self.speech_server.clear_speech()
-        
-        # Pick random action from allowed list
-        action = random.choice(list(self.ACTION_RESPONSES.keys()))
-        expected_response = self.ACTION_RESPONSES.get(action)
-        
-        expected = ExpectedOutcome(
-            min_actions=1,
-            max_wait_time=20.0,
-            description=f"Auto LP action response to '{action}'"
-        )
-        
-        if expected_response:
-            resp_type, resp_value = expected_response
-            if resp_type == "speech":
-                expected.speech_contains = [resp_value]
-            elif resp_type == "ao":
-                expected.actions = [resp_value]
-        
-        start_time = time.time()
-        
-        # Ensure conditions for LP tree action detection
-        self.world_state.update_state(
-            context_label=0,  # calm context for LP
-            valence=0.6,
-            arousal=0.4
-        )
-        
-        # Ensure there's a face with large box for LP (don't clear faces from previous test)
-        state = self.world_state.get_state()
-        if not state['known_faces']:
-            print("[Auto] Adding test face with large box (no face from previous test)")
-            self.world_state.add_face("ActionTest", 0.9, [100, 100, 400, 500])
-        
-        print(f"[Auto] Triggering action: '{action}'")
-        if expected_response:
-            resp_type, resp_value = expected_response
-            print(f"       Expected response: {resp_type}='{resp_value}'")
-        
-        # Set action for person index 0 (first face in list)
-        # The module matches person_id to face index
-        self.world_state.set_action("0", action, 0.9)
-        
-        self._wait_for_action(timeout=expected.max_wait_time, min_actions=1)
-        time.sleep(1)
-        
-        expected.elapsed_time = time.time() - start_time
-        result = self._verify_scenario("Auto LP Action", expected)
-        if result.status == TestStatus.FAIL:
-            result.print_summary()
-        self.test_results.append(result)
-    
-    def _auto_hp_wave(self):
-        """Auto: HP wave only (no known person) with verification.
-        
-        HP wave-only requires:
-        - Face detected (faces_count > 0)
-        - NO known faces (no face_id data)
-        - HP tree selected (lively context or Q-learning chooses HP)
-        """
-        self.world_state.clear_faces()  # Clear known faces
-        self.world_state.clear_actions()
-        self.interaction_server.clear_commands()
-        self.speech_server.clear_speech()
-        
-        expected = ExpectedOutcome(
-            actions=["ao_wave"],
-            min_actions=1,
-            max_wait_time=25.0,
-            description="Auto HP wave-only"
-        )
-        
-        start_time = time.time()
-        
-        # Set lively context (higher chance of HP selection)
-        self.world_state.update_state(context_label=1)  # lively
-        time.sleep(1.5)
-        
-        # Set faces_count > 0 but NO known faces (don't call add_face)
-        # This triggers HP wave-only path: face detected but identity unknown
-        print("[Auto] Unknown face detected (HP wave-only path)")
-        print("       - faces_count=1 but no known_faces")
-        print("       - HP tree should wave without greeting")
-        self.world_state.set_faces_count(1)  # Face detected  
-        self.world_state.update_state(
-            valence=0.5,
-            arousal=0.5
-        )
-        
-        self._wait_for_action(timeout=expected.max_wait_time, min_actions=1)
-        time.sleep(1)
-        
-        expected.elapsed_time = time.time() - start_time
-        result = self._verify_scenario("Auto HP Wave", expected)
-        if result.status == TestStatus.FAIL:
-            result.print_summary()
-        self.test_results.append(result)
-    
-    def _auto_hp_greet(self):
-        """Auto: HP greeting (known face, no gaze required) with verification.
-        
-        HP greeting requires:
-        - Known face (face_id with name)
-        - Person NOT greeted today
-        - HP tree selected (lively context or Q-learning)
-        - NO mutual gaze needed (unlike LP)
-        """
-        self.world_state.clear_faces()
-        self.world_state.clear_actions()
-        self.interaction_server.clear_commands()
-        self.speech_server.clear_speech()
-        
-        expected = ExpectedOutcome(
-            speech_contains=["ciao"],
-            actions=["ao_wave"],
-            min_actions=1,
-            max_wait_time=20.0,
-            description="Auto HP greeting"
-        )
-        
-        start_time = time.time()
-        
-        # Set lively context (higher chance of HP selection)
-        self.world_state.update_state(context_label=1)  # lively
-        time.sleep(1.5)
-        
-        # Add known face for HP greeting path
-        name = f"HP_{random.randint(1000,9999)}"
-        print(f"[Auto] Adding known face '{name}' (HP path)")
-        self.world_state.add_face(name, random.uniform(0.88, 0.98), [100, 100, 350, 400])
-        self.world_state.update_state(
-            valence=random.uniform(0.5, 0.7),
-            arousal=random.uniform(0.5, 0.6)
-        )
-        
-        self._wait_for_action(timeout=expected.max_wait_time, min_actions=1)
-        time.sleep(1)
-        
-        expected.elapsed_time = time.time() - start_time
-        result = self._verify_scenario("Auto HP Greeting", expected)
-        if result.status == TestStatus.FAIL:
-            result.print_summary()
-        self.test_results.append(result)
-    
-    def _auto_state_machine(self):
-        """Auto: Quick state machine test - verifies trees execute in ACTIVE state.
-        
-        Note: Testing ao_start/ao_stop properly requires 60s INACTIVE timeout.
-        This auto test verifies that behavior trees execute when conditions are met,
-        which confirms the module is in ACTIVE state and processing correctly.
-        """
-        self.world_state.clear_faces()
-        self.world_state.clear_actions()
-        self.interaction_server.clear_commands()
-        self.speech_server.clear_speech()
-        
-        # Test that trees actually execute (proof of ACTIVE state)
-        expected = ExpectedOutcome(
-            speech_contains=["ciao"],
-            actions=["ao_wave"],
-            min_actions=1,
-            max_wait_time=20.0,
-            description="Auto state machine (tree execution)"
-        )
-        
-        start_time = time.time()
-        print("[Auto] Testing state machine - tree execution in ACTIVE state")
-        
-        # Add face with large box → should trigger greeting
-        name = f"StateTest_{random.randint(1000,9999)}"
-        print(f"[Auto] Adding '{name}' with large face box...")
-        self.world_state.add_face(name, 0.9, [100, 100, 400, 500])
-        self.world_state.update_state(context_label=0, valence=0.7, arousal=0.5)
-        
-        # Wait for greeting action
-        self._wait_for_action(timeout=expected.max_wait_time, min_actions=1)
-        time.sleep(1)
-        
-        # Check what happened
-        cmds = [c['action'] for c in self.interaction_server.get_commands()]
-        speech = self.speech_server.get_speech()
-        
-        if 'ao_wave' in cmds and speech:
-            print("[Auto] PASS: Tree executed, greeting occurred")
-        elif cmds:
-            print(f"[Auto] Actions received: {cmds}")
-        else:
-            print("[Auto] WARNING: No actions received")
-        
-        expected.elapsed_time = time.time() - start_time
-        result = self._verify_scenario("Auto State Machine", expected)
-        if result.status == TestStatus.FAIL:
-            result.print_summary()
-        self.test_results.append(result)
-    
-    def _auto_context_switch(self):
-        """Auto: Context switching test."""
-        print("[Auto] Testing context switch response")
-        self.world_state.clear_faces()
-        self.world_state.add_face("CtxTest", 0.9, [100, 100, 400, 500])
-        
-        print("[Auto] Starting with calm context")
-        self.world_state.update_state(context_label=0)
-        time.sleep(4)
-        
-        print("[Auto] Switching to lively context")
-        self.world_state.update_state(context_label=1)
-        time.sleep(4)
-    
-    def _auto_high_valence(self):
-        """Auto: High valence interaction."""
-        self.world_state.clear_faces()
-        self.world_state.update_state(context_label=0)
-        time.sleep(1.5)
-        
-        name = f"Happy_{random.randint(1000,9999)}"
-        print(f"[Auto] High valence interaction with '{name}'")
-        self.world_state.add_face(name, 0.92, [100, 100, 400, 500])
-        self.world_state.update_state(
-            valence=random.uniform(0.7, 0.9),
-            arousal=random.uniform(0.5, 0.7)
-        )
-        time.sleep(10)
-    
-    def _auto_low_valence(self):
-        """Auto: Low valence interaction."""
-        self.world_state.clear_faces()
-        self.world_state.update_state(context_label=1)
-        time.sleep(1.5)
-        
-        name = f"Neutral_{random.randint(1000,9999)}"
-        print(f"[Auto] Low valence interaction with '{name}'")
-        self.world_state.add_face(name, 0.88, [100, 100, 350, 400])
-        self.world_state.update_state(
-            valence=random.uniform(0.2, 0.4),
-            arousal=random.uniform(0.2, 0.4)
-        )
-        time.sleep(10)
+    try:
+        while True:
+            for scenario in scenario_list:
+                harness.run_scenario(scenario)
+                time.sleep(2.0)  # Pause between scenarios
+    except KeyboardInterrupt:
+        print("\nStopping continuous mode...")
 
 
-# =============================================================================
-# Main
-# =============================================================================
+# ==================== Main Entry Point ====================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Unified Test Harness for Embodied Behaviour",
+        description="Test Harness for faceSelector and interactionManager",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Interactive mode
-  python unified_test_harness.py
-  
-  # Auto-run for 10 minutes  
-  python unified_test_harness.py --auto-run 10
-  
-  # Don't wait for module
-  python unified_test_harness.py --no-wait
-"""
+    python test_harness.py                      # Interactive mode
+    python test_harness.py --continuous         # Cycle all scenarios continuously
+    python test_harness.py --scenario ss1_success  # Run specific scenario continuously
+    python test_harness.py --list               # List available scenarios
+    python test_harness.py --quiet              # Less verbose output
+        """
     )
-    
-    parser.add_argument("--auto-run", type=float, metavar="MINUTES",
-                       help="Run automated tests for N minutes")
-    parser.add_argument("--no-connect", action="store_true",
-                       help="Don't auto-connect to module")
-    parser.add_argument("--no-wait", action="store_true",
-                       help="Don't wait for module to start")
-    
+    parser.add_argument("--interactive", "-i", action="store_true",
+                       help="Run in interactive mode (default)")
+    parser.add_argument("--continuous", "-c", action="store_true",
+                       help="Run scenarios continuously")
+    parser.add_argument("--scenario", "-s", type=str, default=None,
+                       help="Specific scenario to run (use with --continuous)")
+    parser.add_argument("--list", "-l", action="store_true",
+                       help="List available scenarios and exit")
+    parser.add_argument("--quiet", "-q", action="store_true",
+                       help="Reduce output verbosity")
+    parser.add_argument("--all", "-a", action="store_true",
+                       help="Run all scenarios once and exit")
+
     args = parser.parse_args()
-    
-    harness = UnifiedTestHarness()
-    
-    try:
-        if not harness.setup(
-            auto_connect=not args.no_connect,
-            wait_for_module=not args.no_wait
-        ):
-            return 1
-        
-        if args.auto_run:
-            harness.run_auto_scenarios(args.auto_run)
-        else:
-            harness.run_interactive()
-        
+
+    # List scenarios
+    if args.list:
+        scenarios = create_scenarios()
+        print("\nAvailable test scenarios:")
+        print("=" * 60)
+        for name, scenario in scenarios.items():
+            print(f"\n  {name}")
+            print(f"    Description: {scenario.description}")
+            print(f"    Steps: {len(scenario.steps)}")
+        print()
         return 0
-    
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
+
+    # Initialize YARP
+    yarp.Network.init()
+    if not yarp.Network.checkNetwork():
+        print("ERROR: YARP network not available")
+        print("Start yarpserver first: yarpserver --write")
         return 1
-    
+
+    # Create and configure harness
+    harness = TestHarness(verbose=not args.quiet)
+
+    if not harness.configure():
+        print("ERROR: Failed to configure test harness")
+        return 1
+
+    harness.start()
+
+    print("\n" + "=" * 60)
+    print("TEST HARNESS - YARP Port Simulator")
+    print("=" * 60)
+    print("\nPublishing on ports:")
+    print("  /alwayson/vision/landmarks:o")
+    print("  /alwayson/vision/img:o")
+    print("  /alwayson/stm/context:o")
+    print("  /speech2text/text:o")
+    print("  /acapelaSpeak/bookmark:o")
+    print("\nReceiving on ports:")
+    print("  /acapelaSpeak/speech:i")
+    print("\nRPC servers:")
+    print("  /interactionInterface")
+    print("  /objectRecognition/rpc")
+    print("  /faceTracker/rpc")
+    print("  /speech2text/rpc")
+    print("\n" + "=" * 60)
+
+    # Print connection commands
+    print("\nTo connect faceSelector:")
+    print("  yarp connect /alwayson/vision/landmarks:o /faceSelector/landmarks:i")
+    print("  yarp connect /alwayson/vision/img:o /faceSelector/img:i")
+    print("\nTo connect interactionManager:")
+    print("  yarp connect /alwayson/stm/context:o /interactionManager/context:i")
+    print("  yarp connect /alwayson/vision/landmarks:o /interactionManager/landmarks:i")
+    print("  yarp connect /speech2text/text:o /interactionManager/stt:i")
+    print("  yarp connect /acapelaSpeak/bookmark:o /interactionManager/acapela_bookmark:i")
+    print("  yarp connect /interactionManager/speech:o /acapelaSpeak/speech:i")
+    print("\n" + "=" * 60 + "\n")
+
+    try:
+        if args.all:
+            # Run all scenarios once
+            harness.run_all_scenarios(delay_between=2.0)
+        elif args.continuous:
+            # Continuous mode
+            run_continuous_mode(harness, args.scenario)
+        else:
+            # Interactive mode (default)
+            harness.run_interactive_mode()
+
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
     finally:
-        harness.cleanup()
+        harness.stop()
         yarp.Network.fini()
+        print("Test harness shutdown complete")
+
+    return 0
 
 
 if __name__ == "__main__":
