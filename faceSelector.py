@@ -231,6 +231,25 @@ class FaceSelectorModule(yarp.RFModule):
                 self._log("ERROR", "Failed to open interactionInterface RPC client port")
                 return False
 
+            # Automatically connect RPC client ports
+            self._log("INFO", "Attempting to connect RPC ports...")
+            
+            # Connect to interactionManager
+            if not yarp.Network.connect(f"/{self.module_name}/interactionManager:rpc", 
+                                        self.interaction_manager_rpc_name):
+                self._log("ERROR", f"Failed to connect to {self.interaction_manager_rpc_name}")
+                self._log("ERROR", "Make sure interactionManager is running")
+            else:
+                self._log("INFO", f"Connected to {self.interaction_manager_rpc_name}")
+            
+            # Connect to interactionInterface
+            if not yarp.Network.connect(f"/{self.module_name}/interactionInterface:rpc", 
+                                        self.interaction_interface_rpc_name):
+                self._log("ERROR", f"Failed to connect to {self.interaction_interface_rpc_name}")
+                self._log("ERROR", "Make sure interactionInterface is running")
+            else:
+                self._log("INFO", f"Connected to {self.interaction_interface_rpc_name}")
+
             # Load persistent data
             self._load_all_json_files()
             
@@ -294,7 +313,8 @@ class FaceSelectorModule(yarp.RFModule):
             # Check if day has changed and prune if needed
             today = self._get_today_date()
             if self._current_day != today:
-                self._log("INFO", f"Day changed from {self._current_day} to {today} - pruning old entries")
+                self._log("INFO", f"=== DAY CHANGE: {self._current_day} → {today} ===")
+                self._log("INFO", "Pruning old interaction records...")
                 with self.state_lock:
                     self.greeted_today = self._prune_to_today(self.greeted_today)
                     self.talked_today = self._prune_to_today(self.talked_today)
@@ -305,13 +325,19 @@ class FaceSelectorModule(yarp.RFModule):
             
             # 1. Read latest landmarks (non-blocking)
             faces = self._read_landmarks()
+            if faces:
+                self._log("DEBUG", f"Step 1/6: Read {len(faces)} face(s) from landmarks")
             
             # 2. Read latest image (non-blocking)
             frame = self._read_image()
+            if frame is not None:
+                self._log("DEBUG", f"Step 2/6: Read image frame {frame.shape}")
             
             # 3. Compute states for all faces
             with self.state_lock:
                 self.current_faces = self._compute_face_states(faces)
+            if faces:
+                self._log("DEBUG", f"Step 3/6: Computed states for {len(self.current_faces)} face(s)")
             
             # 4. Select target face (if not busy with interaction)
             with self.state_lock:
@@ -322,6 +348,12 @@ class FaceSelectorModule(yarp.RFModule):
                         self.selected_bbox_last = candidate["bbox"]  # Store for green box persistence
                         self.interaction_busy = True
                         
+                        face_id = candidate.get("face_id", "unknown")
+                        track_id = candidate.get("track_id", -1)
+                        ss = self.SS_NAMES.get(candidate.get("social_state", 0), "?")
+                        ls = self.LS_NAMES.get(candidate.get("learning_state", 1), "?")
+                        self._log("INFO", f"=== SELECTED TARGET: {face_id} (track={track_id}, {ss}, {ls}) ===")
+                        
                         # Start interaction in background thread
                         self.interaction_thread = threading.Thread(
                             target=self._run_interaction_thread,
@@ -329,6 +361,11 @@ class FaceSelectorModule(yarp.RFModule):
                             daemon=True
                         )
                         self.interaction_thread.start()
+                        self._log("DEBUG", "Step 4/6: Started interaction thread")
+                    else:
+                        self._log("DEBUG", "Step 4/6: No eligible face selected")
+                else:
+                    self._log("DEBUG", "Step 4/6: Interaction busy, skipping selection")
             
             # 5. Annotate and publish image
             if frame is not None:
@@ -336,12 +373,14 @@ class FaceSelectorModule(yarp.RFModule):
                     annotated = self._annotate_image(frame, self.current_faces, self.selected_target)
                 self.last_annotated_frame = annotated
                 self._publish_image(annotated)
+                self._log("DEBUG", "Step 5/6: Published annotated image")
             elif self.last_annotated_frame is not None:
                 # Republish last known frame if no new image
                 self._publish_image(self.last_annotated_frame)
             
             # 6. Publish debug info
             self._publish_debug()
+            self._log("DEBUG", "Step 6/6: Published debug info")
             
         except Exception as e:
             self._log("ERROR", f"Error in updateModule: {e}")
@@ -487,16 +526,22 @@ class FaceSelectorModule(yarp.RFModule):
             self._log("WARNING", f"Image rowSize too small: row={row}, w*3={w*3}")
             return None
         
-        buf = yimg.getRawImage()
-        if not buf:
+        # Use YARP's __array_interface__ to get numpy array directly
+        try:
+            # Create numpy array from YARP image using array interface
+            img_array = np.asarray(yimg.__array_interface__)
+            if img_array.size == 0:
+                return None
+            
+            # Reshape to (height, rowSize) then extract valid pixels
+            raw = img_array.reshape((h, row))
+            rgb = raw[:, : w * 3].reshape((h, w, 3)).copy()
+            
+            self.img_width, self.img_height = w, h
+            return rgb
+        except Exception as e:
+            self._log("WARNING", f"Failed to convert YARP image to numpy: {e}")
             return None
-        
-        # Read exactly h*row bytes then crop each row to w*3
-        raw = np.frombuffer(buf, dtype=np.uint8, count=h * row).reshape((h, row))
-        rgb = raw[:, : w * 3].reshape((h, w, 3)).copy()
-        
-        self.img_width, self.img_height = w, h
-        return rgb
 
     def _publish_image(self, frame_rgb: np.ndarray):
         """Publish annotated image to YARP port (stride-safe)."""
@@ -513,15 +558,20 @@ class FaceSelectorModule(yarp.RFModule):
                 self._log("WARNING", f"Output rowSize too small: row={row}, w*3={w*3}")
                 return
             
-            out_buf = out.getRawImage()
-            out_raw = np.frombuffer(out_buf, dtype=np.uint8, count=h * row).reshape((h, row))
-            
-            # Write pixels; zero padding (optional but nice)
-            out_raw[:, : w * 3] = frame_rgb.reshape((h, w * 3))
-            if row > w * 3:
-                out_raw[:, w * 3 :] = 0
-            
-            self.img_out_port.write()
+            # Use YARP's __array_interface__ to write numpy array directly
+            try:
+                out_array = np.asarray(out.__array_interface__)
+                out_raw = out_array.reshape((h, row))
+                
+                # Write pixels; zero padding (optional but nice)
+                out_raw[:, : w * 3] = frame_rgb.reshape((h, w * 3))
+                if row > w * 3:
+                    out_raw[:, w * 3 :] = 0
+                
+                self.img_out_port.write()
+            except Exception as e:
+                self._log("WARNING", f"Failed to write numpy array to YARP image: {e}")
+                
         except Exception as e:
             self._log("WARNING", f"Failed to publish image: {e}")
 
@@ -644,23 +694,34 @@ class FaceSelectorModule(yarp.RFModule):
             # Determine if known: check both current face_id and stable person_id
             is_known = self._is_face_known(face_id) or self._is_face_known(person_id)
             face["is_known"] = is_known
+            self._log("DEBUG", f"Face {face_id}: is_known={is_known}")
             
             # Check greeted today
             greeted_today = self._was_greeted_today(person_id, today)
             face["greeted_today"] = greeted_today
+            self._log("DEBUG", f"Face {face_id}: greeted_today={greeted_today}")
             
             # Check talked today
             talked_today = self._was_talked_today(person_id, today)
             face["talked_today"] = talked_today
+            self._log("DEBUG", f"Face {face_id}: talked_today={talked_today}")
             
             # Compute social state
             face["social_state"] = self._compute_social_state(is_known, greeted_today, talked_today)
+            ss_name = self.SS_NAMES.get(face["social_state"], "?")
+            self._log("DEBUG", f"Face {face_id}: social_state={ss_name}")
             
             # Get learning state
             face["learning_state"] = self._get_learning_state(person_id)
+            ls_name = self.LS_NAMES.get(face["learning_state"], "?")
+            self._log("DEBUG", f"Face {face_id}: learning_state={ls_name}")
             
             # Check eligibility based on learning state and spatial state
             face["eligible"] = self._is_eligible(face)
+            zone = face.get("zone", "?")
+            dist = face.get("distance", "?")
+            attn = face.get("attention", "?")
+            self._log("DEBUG", f"Face {face_id}: spatial=({zone}/{dist}/{attn}), eligible={face['eligible']}")
         
         # Prune track_to_person to prevent unbounded growth
         active_tracks = {f["track_id"] for f in faces if f.get("track_id", -1) >= 0}
@@ -756,6 +817,7 @@ class FaceSelectorModule(yarp.RFModule):
         """Select best face based on priority rules."""
         # Filter to eligible faces only
         eligible = [f for f in faces if f.get("eligible", False)]
+        self._log("DEBUG", f"Selection: {len(eligible)}/{len(faces)} faces eligible")
         
         if not eligible:
             # If no eligible faces and SS5 selection is disabled, check if we should allow SS5
@@ -763,12 +825,15 @@ class FaceSelectorModule(yarp.RFModule):
                 # Try SS5 faces as last resort (configurable)
                 ss5_faces = [f for f in faces if f.get("social_state") == self.SS5]
                 if ss5_faces:
+                    self._log("DEBUG", f"Selection: No eligible faces, checking {len(ss5_faces)} SS5 faces")
                     # Still check spatial eligibility
                     ss5_eligible = [f for f in ss5_faces if self._check_spatial_only(f)]
                     if ss5_eligible:
+                        self._log("DEBUG", f"Selection: {len(ss5_eligible)} SS5 faces spatially eligible")
                         eligible = ss5_eligible
             
             if not eligible:
+                self._log("DEBUG", "Selection: No faces available for interaction")
                 return None
         
         # Sort by priority:
@@ -787,7 +852,14 @@ class FaceSelectorModule(yarp.RFModule):
             return (ss, -attention, -distance, -time_in_view)
         
         eligible.sort(key=sort_key)
-        return eligible[0]
+        best = eligible[0]
+        
+        ss_name = self.SS_NAMES.get(best.get("social_state", 0), "?")
+        attn = best.get("attention", "?")
+        dist = best.get("distance", "?")
+        self._log("INFO", f"Selection: Best candidate - {best['face_id']} ({ss_name}, {attn}, {dist})")
+        
+        return best
 
     def _check_spatial_only(self, face: Dict[str, Any]) -> bool:
         """Check spatial eligibility for a face (ignoring SS)."""
@@ -810,13 +882,16 @@ class FaceSelectorModule(yarp.RFModule):
     def _run_interaction_thread(self, target: Dict[str, Any]):
         """Run interaction in background thread."""
         try:
-            self._log("INFO", f"Starting interaction with face_id={target['face_id']}, track_id={target['track_id']}")
+            track_id = target["track_id"]
+            face_id = target["face_id"]
+            ss = target.get("social_state", self.SS1)
+            
+            self._log("INFO", f"=== INTERACTION START: {face_id} (track={track_id}) ===")
             
             # Determine start state
-            ss = target.get("social_state", self.SS1)
             if ss == self.SS5:
                 # SS5 - don't run by default
-                self._log("INFO", "SS5 face - skipping interaction")
+                self._log("INFO", "Interaction: SS5 face - skipping interaction")
                 return
             
             state_map = {
@@ -826,25 +901,27 @@ class FaceSelectorModule(yarp.RFModule):
                 self.SS4: "ss4"
             }
             start_state = state_map.get(ss, "ss1")
-            
-            track_id = target["track_id"]
-            face_id = target["face_id"]
+            self._log("INFO", f"Interaction: Starting from state '{start_state}'")
             
             # Execute ao_start first
+            self._log("INFO", "Interaction: Executing ao_start behaviour")
             self._execute_interaction_interface("ao_start")
             
             try:
                 # Run interaction manager
+                self._log("INFO", f"Interaction: Calling interactionManager RPC")
                 result = self._run_interaction_manager(track_id, face_id, start_state)
                 
                 if result:
+                    self._log("INFO", f"Interaction: Received result (success={result.get('success')})")
                     # Process result and update states
                     self._process_interaction_result(result, target)
                 else:
-                    self._log("WARNING", "No result from interactionManager")
+                    self._log("WARNING", "Interaction: No result from interactionManager")
                     
             finally:
                 # Always execute ao_stop
+                self._log("INFO", "Interaction: Executing ao_stop behaviour")
                 self._execute_interaction_interface("ao_stop")
         
         except Exception as e:
@@ -857,13 +934,13 @@ class FaceSelectorModule(yarp.RFModule):
                 self.interaction_busy = False
                 self.selected_target = None
                 self.selected_bbox_last = None  # Clear stored bbox
-            self._log("INFO", "Interaction completed")
+            self._log("INFO", "=== INTERACTION COMPLETE ===")
 
     def _execute_interaction_interface(self, command: str) -> bool:
         """Execute a command on /interactionInterface via RPC."""
         try:
             if self.interaction_interface_rpc.getOutputCount() == 0:
-                self._log("WARNING", f"interactionInterface RPC not connected")
+                self._log("WARNING", f"RPC: interactionInterface not connected")
                 return False
             
             cmd = yarp.Bottle()
@@ -872,22 +949,24 @@ class FaceSelectorModule(yarp.RFModule):
             
             reply = yarp.Bottle()
             
+            self._log("DEBUG", f"RPC → interactionInterface: exe {command}")
+            
             if self.interaction_interface_rpc.write(cmd, reply):
-                self._log("INFO", f"interactionInterface: exe {command} -> {reply.toString()}")
+                self._log("DEBUG", f"RPC ← interactionInterface: {reply.toString()}")
                 return True
             else:
-                self._log("WARNING", f"interactionInterface RPC write failed for: {command}")
+                self._log("WARNING", f"RPC: Write failed for command '{command}'")
                 return False
                 
         except Exception as e:
-            self._log("ERROR", f"interactionInterface error: {e}")
+            self._log("ERROR", f"RPC: interactionInterface exception: {e}")
             return False
 
     def _run_interaction_manager(self, track_id: int, face_id: str, start_state: str) -> Optional[Dict]:
         """Run interaction manager RPC and parse result."""
         try:
             if self.interaction_manager_rpc.getOutputCount() == 0:
-                self._log("WARNING", "interactionManager RPC not connected")
+                self._log("WARNING", "RPC: interactionManager not connected")
                 return None
             
             # Build command: ["run", track_id, face_id, start_state]
@@ -899,11 +978,11 @@ class FaceSelectorModule(yarp.RFModule):
             
             reply = yarp.Bottle()
             
-            self._log("INFO", f"Sending to interactionManager: {cmd.toString()}")
+            self._log("DEBUG", f"RPC → interactionManager: {cmd.toString()}")
             
             # This call blocks until interaction completes
             if self.interaction_manager_rpc.write(cmd, reply):
-                self._log("INFO", f"interactionManager reply size: {reply.size()}")
+                self._log("DEBUG", f"RPC ← interactionManager: reply size={reply.size()}")
                 
                 # Parse reply: ["ok", "json_string"]
                 if reply.size() >= 2:
@@ -913,23 +992,26 @@ class FaceSelectorModule(yarp.RFModule):
                     if status == "ok":
                         try:
                             result = json.loads(json_str)
-                            self._log("INFO", f"Parsed result: success={result.get('success')}, final_state={result.get('final_state')}")
+                            success = result.get('success', False)
+                            final_state = result.get('final_state', '?')
+                            steps_count = len(result.get('steps', []))
+                            self._log("INFO", f"RPC: Parsed result - success={success}, final={final_state}, steps={steps_count}")
                             return result
                         except json.JSONDecodeError as e:
-                            self._log("ERROR", f"Failed to parse JSON: {e}")
+                            self._log("ERROR", f"RPC: JSON parse failed: {e}")
                             return None
                     else:
-                        self._log("WARNING", f"interactionManager returned status: {status}")
+                        self._log("WARNING", f"RPC: Non-ok status: {status}")
                         return None
                 else:
-                    self._log("WARNING", f"Unexpected reply format: {reply.toString()}")
+                    self._log("WARNING", f"RPC: Unexpected reply format: {reply.toString()}")
                     return None
             else:
-                self._log("ERROR", "interactionManager RPC write failed")
+                self._log("ERROR", "RPC: Write to interactionManager failed")
                 return None
                 
         except Exception as e:
-            self._log("ERROR", f"interactionManager error: {e}")
+            self._log("ERROR", f"RPC: interactionManager exception: {e}")
             return None
 
     def _process_interaction_result(self, result: Dict, target: Dict):
@@ -939,9 +1021,11 @@ class FaceSelectorModule(yarp.RFModule):
             final_state = result.get("final_state", "")
             steps = result.get("steps", [])
             
+            self._log("INFO", f"Processing result: success={success}, final_state={final_state}, steps={len(steps)}")
+            
             # Resolve person_id
             person_id = self._resolve_person_id(result, target)
-            self._log("INFO", f"Resolved person_id: {person_id}")
+            self._log("INFO", f"Result: Resolved person_id = '{person_id}'")
             
             track_id = target["track_id"]
             now_iso = datetime.now(self.TIMEZONE).isoformat()
@@ -958,11 +1042,13 @@ class FaceSelectorModule(yarp.RFModule):
                     # Check if greeting was attempted
                     if step.get("status") == "success" or details.get("greet_attempt") == "successful":
                         greeted = True
+                        self._log("INFO", f"Result: {step_name} completed - marking as greeted")
                 
                 if step_name == "ss4":
                     turns = details.get("turns_count", 0)
                     if turns >= 1:
                         talked = True
+                        self._log("INFO", f"Result: ss4 had {turns} turns - marking as talked")
             
             # Thread-safe: update shared state under lock
             with self.state_lock:
@@ -975,15 +1061,15 @@ class FaceSelectorModule(yarp.RFModule):
             # Save files outside lock (I/O can be slow)
             if greeted:
                 self._save_greeted_json()
-                self._log("INFO", f"Updated greeted_today for {person_id}")
+                self._log("INFO", f"Result: Saved greeted_today for '{person_id}'")
             
             if talked:
                 self._save_talked_json()
-                self._log("INFO", f"Updated talked_today for {person_id}")
+                self._log("INFO", f"Result: Saved talked_today for '{person_id}'")
             
             # Compute interaction score and update learning state
             delta = self._compute_interaction_score(result)
-            self._log("INFO", f"Interaction score delta: {delta}")
+            self._log("INFO", f"Result: Interaction score delta = {delta:+d}")
             
             # Update learning state
             self._update_learning_state(person_id, delta)
@@ -1105,13 +1191,20 @@ class FaceSelectorModule(yarp.RFModule):
         with self.state_lock:
             current_ls = self.learning_data.get(person_id, {}).get("ls", self.LS1)
         
+        old_ls_name = self.LS_NAMES.get(current_ls, "?")
+        self._log("INFO", f"LS Update: person='{person_id}', current={old_ls_name}, delta={delta:+d}")
+        
         new_ls = current_ls
         
         # Apply delta thresholds
         if delta >= 4:
             new_ls = min(4, current_ls + 1)
+            self._log("DEBUG", f"LS Update: delta >= 4, attempting increase {current_ls} -> {new_ls}")
         elif delta <= -4:
             new_ls = max(1, current_ls - 1)
+            self._log("DEBUG", f"LS Update: delta <= -4, attempting decrease {current_ls} -> {new_ls}")
+        else:
+            self._log("DEBUG", f"LS Update: |delta| < 4, no state change")
         # else: no change
         
         # Update under lock, save outside lock
@@ -1125,7 +1218,8 @@ class FaceSelectorModule(yarp.RFModule):
         self._save_learning_json()
         
         if new_ls != current_ls:
-            self._log("INFO", f"Learning state updated: {person_id} LS{current_ls} -> LS{new_ls} (delta={delta})")
+            new_ls_name = self.LS_NAMES.get(new_ls, "?")
+            self._log("INFO", f"LS Update: '{person_id}' → {old_ls_name} to {new_ls_name}")
         else:
             self._log("INFO", f"Learning state unchanged: {person_id} LS{current_ls} (delta={delta})")
 

@@ -66,7 +66,7 @@ class InteractionManagerModule(yarp.RFModule):
         self.log_buffer: List[Dict] = []
         
         # YARP ports (initialized in configure)
-        self.rpc_port: Optional[yarp.RpcServer] = None
+        # Note: RPC is built into RFModule, no separate rpc_port needed
         self.context_port: Optional[yarp.BufferedPortBottle] = None
         self.landmarks_port: Optional[yarp.BufferedPortBottle] = None
         self.stt_port: Optional[yarp.BufferedPortBottle] = None
@@ -79,24 +79,30 @@ class InteractionManagerModule(yarp.RFModule):
             if rf.check("name"):
                 self.module_name = rf.find("name").asString()
             
-            # Open ports
+            # Set module name - RFModule handles RPC automatically via respond()
+            self.setName(self.module_name)
+            
+            # Create port objects as instance variables
+            self.context_port = yarp.BufferedPortBottle()
+            self.landmarks_port = yarp.BufferedPortBottle()
+            self.stt_port = yarp.BufferedPortBottle()
+            self.bookmark_port = yarp.BufferedPortBottle()
+            self.speech_port = yarp.Port()
+            
+            # Open all ports
             ports = [
-                ("rpc_port", yarp.RpcServer(), "", True),
-                ("context_port", yarp.BufferedPortBottle(), "context:i", False),
-                ("landmarks_port", yarp.BufferedPortBottle(), "landmarks:i", False),
-                ("stt_port", yarp.BufferedPortBottle(), "stt:i", False),
-                ("bookmark_port", yarp.BufferedPortBottle(), "acapela_bookmark:i", False),
-                ("speech_port", yarp.Port(), "speech:o", False),
+                (self.context_port, "context:i"),
+                (self.landmarks_port, "landmarks:i"),
+                (self.stt_port, "stt:i"),
+                (self.bookmark_port, "acapela_bookmark:i"),
+                (self.speech_port, "speech:o"),
             ]
             
-            for attr, port, suffix, attach in ports:
-                port_name = f"/{self.module_name}/{suffix}" if suffix else f"/{self.module_name}"
+            for port, suffix in ports:
+                port_name = f"/{self.module_name}/{suffix}"
                 if not port.open(port_name):
                     self._log("ERROR", f"Failed to open {port_name}")
                     return False
-                setattr(self, attr, port)
-                if attach:
-                    self.attach(port)
                 self._log("INFO", f"Opened {port_name}")
             
             # Initialize tracking file
@@ -110,12 +116,14 @@ class InteractionManagerModule(yarp.RFModule):
             
         except Exception as e:
             self._log("ERROR", f"Configuration failed: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def interruptModule(self) -> bool:
         """Interrupt all ports."""
         self._log("INFO", "Interrupting module...")
-        for port in [self.rpc_port, self.context_port, self.landmarks_port, 
+        for port in [self.context_port, self.landmarks_port, 
                      self.stt_port, self.bookmark_port, self.speech_port]:
             if port:
                 port.interrupt()
@@ -124,7 +132,7 @@ class InteractionManagerModule(yarp.RFModule):
     def close(self) -> bool:
         """Close all ports."""
         self._log("INFO", "Closing module...")
-        for port in [self.rpc_port, self.context_port, self.landmarks_port,
+        for port in [self.context_port, self.landmarks_port,
                      self.stt_port, self.bookmark_port, self.speech_port]:
             if port:
                 port.close()
@@ -147,6 +155,7 @@ class InteractionManagerModule(yarp.RFModule):
                 return self._reply_error(reply, "Empty command")
             
             command = cmd.get(0).asString()
+            self._log("DEBUG", f"RPC command received: {command}")
             
             # Help command
             if command == "help":
@@ -177,10 +186,13 @@ class InteractionManagerModule(yarp.RFModule):
             
             # Acquire lock (non-blocking)
             if not self.run_lock.acquire(blocking=False):
+                self._log("WARNING", "Another interaction already in progress")
                 return self._reply_error(reply, "Another action is running", "busy")
             
             try:
                 self.log_buffer = []
+                self._log("INFO", "=== Starting new interaction ===")
+                self._log("INFO", f"Parameters: track_id={track_id}, face_id={face_id}, state={social_state}")
                 self.ensure_stt_ready("english")
                 self._log("INFO", f"Starting {social_state} for track_id={track_id}, face_id={face_id}")
                 
@@ -270,35 +282,45 @@ class InteractionManagerModule(yarp.RFModule):
         
         try:
             # Step 0: Register face with unique code
-            self._log("INFO", "SS1: Registering face")
+            self._log("INFO", "SS1 Step 1/4: Generating unique face code")
             code = self._generate_unique_code()
             result["assigned_code"] = code
+            self._log("INFO", f"SS1: Generated code '{code}'")
             
+            self._log("INFO", "SS1 Step 2/4: Registering face with objectRecognition")
             if not self._register_face(code, track_id) or not self._verify_face_registration(code):
-                self._log("ERROR", "Face registration failed")
+                self._log("ERROR", "SS1: Face registration failed")
                 return result
             
             result["face_submission"] = "successful"
-            self._log("INFO", f"Face registered: {code}")
+            self._log("INFO", f"SS1: Face registered successfully as '{code}'")
             
             # Step 1: Read context
+            self._log("INFO", "SS1: Reading environment context")
             context = self._read_and_store_context(result)
+            self._log("INFO", f"SS1: Context = {context.get('label_str', 'unknown')}")
             
             # Step 2: Greet based on context
-            self._log("INFO", "SS1: Greeting")
+            self._log("INFO", "SS1 Step 3/4: Performing greeting gesture")
             behaviour = "ao_wave" if context.get("label_int") == 0 else "ao_hi"
+            self._log("INFO", f"SS1: Executing behaviour '{behaviour}'")
             if self._execute_behaviour(behaviour):
                 result["greet_attempt"] = "successful"
+                self._log("INFO", "SS1: Waiting for TTS to complete")
                 self.wait_tts_end(self.TTS_TIMEOUT)
             
             # Step 3: Log greeting
+            self._log("INFO", "SS1: Recording greeting in memory")
             self._write_last_greeted(track_id, face_id, code)
             
             # Step 4: Detect response
-            self._log("INFO", "SS1: Detecting response")
+            self._log("INFO", "SS1 Step 4/4: Waiting for user response")
             if self._detect_greeting_response(result):
+                self._log("INFO", "SS1: Response detected! → Transitioning to SS2")
                 result["success"] = True
                 result["next_state"] = "ss2"
+            else:
+                self._log("WARNING", "SS1: No response detected, interaction ending")
             
             return result
             
@@ -318,26 +340,35 @@ class InteractionManagerModule(yarp.RFModule):
             
             for attempt in range(max_attempts):
                 result["attempts"] = attempt + 1
-                self._log("INFO", f"SS2: Attempt {attempt + 1}/{max_attempts}")
+                self._log("INFO", f"SS2: === Attempt {attempt + 1}/{max_attempts} ===")
                 
                 # Ask name
+                self._log("INFO", f"SS2: Generating name question using LLM")
                 ask_text = self._llm_generate_ask_name() or "What is your name?"
+                self._log("INFO", f"SS2: Asking: '{ask_text}'")
                 self._speak(ask_text)
                 self.wait_tts_end(self.TTS_TIMEOUT)
                 self._clear_stt_buffer()
                 
                 # Wait for response
+                self._log("INFO", f"SS2: Listening for response (timeout={self.STT_TIMEOUT}s)")
                 utterance = self.wait_user_utterance(self.STT_TIMEOUT)
                 result["user_utterance"] = utterance
                 
                 if not utterance:
+                    self._log("WARNING", f"SS2: No speech detected in attempt {attempt + 1}")
                     continue
                 
+                self._log("INFO", f"SS2: Heard: '{utterance}'")
+                
                 # Check for valid response
+                self._log("INFO", "SS2: Checking if response is valid")
                 if not self._llm_detect_any_response(utterance).get("responded"):
+                    self._log("WARNING", "SS2: LLM classified as non-response")
                     continue
                 
                 # Extract name
+                self._log("INFO", "SS2: Extracting name from utterance")
                 extraction = self._llm_extract_name(utterance)
                 result["name_extraction_result"] = extraction
                 
@@ -345,16 +376,21 @@ class InteractionManagerModule(yarp.RFModule):
                     name = extraction["name"]
                     result["extracted_name"] = name
                     result["name_confidence"] = extraction.get("confidence", 0.0)
+                    self._log("INFO", f"SS2: Name extracted: '{name}' (confidence={result['name_confidence']:.2f})")
                     
                     # Update face file and tracker
+                    self._log("INFO", "SS2: Updating face recognition system")
                     code = self._find_face_code_for_track(track_id) or face_id
                     result["rename_success"] = self._rename_face_file(code, name)
                     self._set_face_tracker(name)
                     self._update_last_greeted_name(track_id, name)
                     
+                    self._log("INFO", f"SS2: Success! → Transitioning to SS4")
                     result["success"] = True
                     result["next_state"] = "ss4"
                     return result
+                else:
+                    self._log("WARNING", "SS2: Could not extract name from response")
             
             self._log("INFO", "SS2: Failed after all attempts")
             return result
@@ -376,16 +412,21 @@ class InteractionManagerModule(yarp.RFModule):
             
             for attempt in range(max_attempts):
                 result["attempts"] = attempt + 1
-                self._log("INFO", f"SS3: Attempt {attempt + 1}/{max_attempts}")
+                self._log("INFO", f"SS3: === Attempt {attempt + 1}/{max_attempts} ===")
                 
+                self._log("INFO", f"SS3: Greeting known person '{face_id}'")
                 self._speak(f"Hello {face_id}")
                 self.wait_tts_end(self.TTS_TIMEOUT)
                 self._clear_stt_buffer()
                 
+                self._log("INFO", "SS3: Waiting for greeting response")
                 if self._detect_greeting_response(result):
+                    self._log("INFO", "SS3: Response detected! → Transitioning to SS4")
                     result["success"] = True
                     result["next_state"] = "ss4"
                     return result
+                else:
+                    self._log("WARNING", f"SS3: No response in attempt {attempt + 1}")
             
             self._log("INFO", "SS3: Failed after all attempts")
             return result
@@ -405,33 +446,39 @@ class InteractionManagerModule(yarp.RFModule):
             self._set_face_tracker(face_id)
             
             # Conversation starter
+            self._log("INFO", "SS4: Generating conversation starter using LLM")
             starter = self._llm_generate_convo_starter() or "How are you doing today?"
             result["robot_utterances"].append(starter)
+            self._log("INFO", f"SS4: Starting conversation: '{starter}'")
             self._speak(starter)
             self.wait_tts_end(self.TTS_TIMEOUT)
             self._clear_stt_buffer()
             
             # Conversation loop
-            self._log("INFO", "SS4: Starting conversation")
+            self._log("INFO", f"SS4: Starting conversation loop (max {self.SS4_MAX_TURNS} turns, {self.SS4_MAX_TIME}s timeout)")
             user_responded = False
             
             while result["turns"] < self.SS4_MAX_TURNS:
-                if time.time() - start_time > self.SS4_MAX_TIME:
-                    self._log("INFO", "SS4: Time limit reached")
+                elapsed = time.time() - start_time
+                if elapsed > self.SS4_MAX_TIME:
+                    self._log("INFO", f"SS4: Time limit reached ({elapsed:.1f}s)")
                     break
                 
+                self._log("INFO", f"SS4: Listening for user response (turn {result['turns']+1}/{self.SS4_MAX_TURNS})")
                 utterance = self.wait_user_utterance(self.STT_TIMEOUT)
                 if not utterance:
-                    self._log("INFO", "SS4: No response, ending")
+                    self._log("INFO", "SS4: No response detected, ending conversation")
                     break
                 
                 result["turns"] += 1
                 result["user_responses"].append(utterance)
                 user_responded = True
-                self._log("INFO", f"SS4 Turn {result['turns']}: {utterance}")
+                self._log("INFO", f"SS4 Turn {result['turns']}: User said: '{utterance}'")
                 
+                self._log("INFO", "SS4: Generating followup response using LLM")
                 followup = self._llm_generate_followup(utterance, result["user_responses"]) or "I see."
                 result["robot_utterances"].append(followup)
+                self._log("INFO", f"SS4: Robot responds: '{followup}'")
                 self._speak(followup)
                 self.wait_tts_end(self.TTS_TIMEOUT)
                 self._clear_stt_buffer()
@@ -439,7 +486,9 @@ class InteractionManagerModule(yarp.RFModule):
             if user_responded:
                 result["success"] = True
                 result["next_state"] = "ss5"
-                self._log("INFO", "SS4: Success → SS5")
+                self._log("INFO", f"SS4: Conversation successful ({result['turns']} turns) → SS5")
+            else:
+                self._log("WARNING", "SS4: User never responded, interaction failed")
             
             return result
             
