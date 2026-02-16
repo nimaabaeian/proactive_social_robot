@@ -40,6 +40,8 @@ This system implements a **proactive social robot** using the iCub humanoid robo
 
 ### 1. **perception.py** - Vision Analyzer Module
 
+> **Note**: This module is part of the external vision system and is not included in this repository. It provides the landmark data consumed by faceSelector.
+
 **Purpose**: Real-time face detection, tracking, landmark extraction, and gaze analysis.
 
 **Key Technologies**:
@@ -78,6 +80,8 @@ This system implements a **proactive social robot** using the iCub humanoid robo
 - Input: `/alwayson/vision/img:i` - Raw camera feed
 - Input: `/alwayson/vision/recognition:i` - Object recognition results
 - Output: `/alwayson/vision/landmarks:o` - Detailed face analysis
+
+> **Note**: The actual input port used by faceSelector is `/alwayson/vision/img:o` (output from vision system)
 
 ---
 
@@ -130,6 +134,21 @@ This system implements a **proactive social robot** using the iCub humanoid robo
 - Runs in background thread (non-blocking)
 - Sends RPC: `run <track_id> <face_id> <ss1|ss2|ss3|ss4>`
 - Processes result to update learning state based on interaction quality
+- RPC ports auto-connect during module configuration
+
+**Configuration Flags**:
+- `--allow_ss5 <true/false>` - Allow SS5 faces to be selected (default: false)
+- `--verbose <true/false>` - Enable verbose DEBUG logging (default: false)
+- `--rate <seconds>` - Update period in seconds (default: 0.05 = 20 Hz)
+
+**Thread Safety**:
+- Uses `state_lock` for thread-safe access to shared state
+- Interaction runs in background thread without blocking face detection
+
+**Timezone Configuration**:
+- Default timezone: `Europe/Rome`
+- Automatic daily reset at midnight (timezone-aware)
+- "Today" computed using configured timezone
 
 ---
 
@@ -177,10 +196,21 @@ SS4 (Conversation)
 - Conversation generation: Context-aware followups
 
 **Interaction Scoring** (for learning state updates):
-- Base score from social state transition success
-- Bonuses: Context relevance, multiple turns, quick responses
-- Penalties: Timeouts, no responses, errors
-- Thresholds: +15 → upgrade LS, -10 → downgrade LS
+- **SS1**: response_detected=+2, greet_successful=+1, else=-2
+- **SS2**: name extracted (confidence≥0.7)=+3, name only=+1, attempts≥2=-2, else=-3
+- **SS3**: response_detected=+2, else=-2
+- **SS4**: turns≥5=+4, turns≥3=+2, turns≥1=0, else=-4
+- **Global failure penalty**: -3
+- **Thresholds**: delta ≥+4 → upgrade LS, delta ≤-4 → downgrade LS
+
+**Error Recovery**:
+- LLM requests: 3 retry attempts with 1-second delay
+- Fallback JSON logging if SQLite database fails
+- TTS bookmark fallback: tries both `mkr` and `mrk` tags
+
+**Thread Safety**:
+- Uses `run_lock` to prevent concurrent interaction execution
+- Only one interaction runs at a time
 
 **YARP Ports**:
 - Input: `/interactionManager/context:i` - Environment context (calm/lively)
@@ -304,24 +334,32 @@ sqlite3            # Database (stdlib)
 
 ### External Services
 - **YARP Network**: Must be running (`yarp server`)
-- **Ollama**: Must have `phi3:mini-q4` model downloaded
+- **Ollama**: Must have `phi3:mini` model downloaded
 - **Object Recognition Module**: Provides face detection/tracking
 - **Acapela TTS**: Text-to-speech synthesis
 - **Speech2Text**: Speech recognition module
 
+### Hardcoded System Paths
+- **Face storage directory**: `/usr/local/src/robot/cognitiveInteraction/objectRecognition/modules/objectRecognition/faces`
+- **Ollama URL**: `http://localhost:11434`
+- Ensure these paths exist or update code accordingly
+
 ### File System
 ```
 proactive_social_robot/
-├── perception.py
-├── faceSelector.py
-├── interactionManager.py
-├── mock_context_publisher.py
-├── learning.json              # Generated at runtime
-├── greeted_today.json         # Generated at runtime
-├── talked_today.json          # Generated at runtime
-├── interaction_data.db        # Generated at runtime
-└── face_landmarker.task       # MediaPipe model file
+├── faceSelector.py            # Face selection and decision logic
+├── interactionManager.py      # Interaction state machine execution
+├── mock_context_publisher.py  # Context simulation for testing
+├── README.md                  # This document
+├── learning.json              # Generated at runtime (learning states)
+├── greeted_today.json         # Generated at runtime (daily greetings)
+├── talked_today.json          # Generated at runtime (daily conversations)
+├── interaction_data.db        # Generated at runtime (SQLite log)
+├── interaction_fallback.json  # Generated on DB failure (fallback log)
+└── last_greeted.json          # Generated at runtime (track→face mapping)
 ```
+
+> **Note**: `perception.py` is part of the external vision system and not included in this repository.
 
 ---
 
@@ -329,15 +367,17 @@ proactive_social_robot/
 
 ```
 Camera Feed
-    └─▶ /alwayson/vision/img:i (perception.py)
+    └─▶ /alwayson/vision/img:i (perception.py - external)
 
 Object Recognition
-    └─▶ /alwayson/vision/recognition:i (perception.py)
+    └─▶ /alwayson/vision/recognition:i (perception.py - external)
 
-perception.py
-    └─▶ /alwayson/vision/landmarks:o
-         ├─▶ /faceSelector/landmarks:i (faceSelector.py)
-         └─▶ /interactionManager/landmarks:i (interactionManager.py)
+perception.py (external)
+    ├─▶ /alwayson/vision/landmarks:o
+    │    ├─▶ /faceSelector/landmarks:i (faceSelector.py)
+    │    └─▶ /interactionManager/landmarks:i (interactionManager.py)
+    └─▶ /alwayson/vision/img:o
+         └─▶ /faceSelector/img:i (for annotation)
 
 Context Publisher
     └─▶ /alwayson/stm/context:o
@@ -359,11 +399,23 @@ interactionManager.py
 
 ## Performance Characteristics
 
-- **Perception**: ~20 Hz (50ms period)
-- **Face Selection**: ~20 Hz (50ms period)
-- **LLM Inference**: ~5-30 seconds per query (local CPU)
+- **Perception**: ~20 Hz (50ms period) - external module
+- **Face Selection**: ~20 Hz (50ms period, configurable via `--rate`)
+- **Interaction Manager**: 1 Hz (1s period)
+- **LLM Inference**: Variable, 60s timeout with 3 retry attempts
 - **STT Timeout**: 10 seconds
-- **TTS Duration**: Variable (5-15 seconds typical)
+- **TTS Timeout**: 30 seconds with bookmark fallback
+- **File Verification Timeout**: 5 seconds (face registration)
 - **SS1 Duration**: ~15-30 seconds
-- **SS2 Duration**: ~30-60 seconds
-- **SS4 Duration**: ~60-120 seconds (max)
+- **SS2 Duration**: ~30-60 seconds (2 attempts max in lively context, 1 in calm)
+- **SS3 Duration**: ~15-30 seconds (2 attempts max in lively context, 1 in calm)
+- **SS4 Duration**: 60-120 seconds (max 5 turns or 120s timeout)
+
+## Error Handling & Recovery
+
+- **Consecutive errors**: faceSelector stops after 10 consecutive errors
+- **Database failure**: Automatic fallback to JSON file logging
+- **LLM failure**: 3 retry attempts with exponential backoff
+- **Port disconnection**: Graceful handling with status logging
+- **TTS bookmark timeout**: Fallback sleep timers (1.4s or 1.0s)
+- **Thread safety**: Lock-based synchronization prevents race conditions
