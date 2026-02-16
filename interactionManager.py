@@ -36,7 +36,7 @@ class InteractionManagerModule(yarp.RFModule):
     
     FACES_DIR = "/usr/local/src/robot/cognitiveInteraction/objectRecognition/modules/objectRecognition/faces"
     OLLAMA_URL = "http://localhost:11434"
-    LLM_MODEL = "phi3:mini-q4"
+    LLM_MODEL = "phi3:mini"
     DB_FILE = "interaction_data.db"
     
     # Timeouts (seconds)
@@ -72,6 +72,12 @@ class InteractionManagerModule(yarp.RFModule):
         self.stt_port: Optional[yarp.BufferedPortBottle] = None
         self.bookmark_port: Optional[yarp.BufferedPortBottle] = None
         self.speech_port: Optional[yarp.Port] = None
+        
+        # Error recovery
+        self.llm_retry_attempts = 3
+        self.llm_retry_delay = 1.0
+        self.ollama_last_check = 0.0
+        self.ollama_check_interval = 60.0  # Check Ollama health every 60s
 
     def configure(self, rf: yarp.ResourceFinder) -> bool:
         """Configure module and open YARP ports."""
@@ -184,10 +190,10 @@ class InteractionManagerModule(yarp.RFModule):
             if social_state not in self.VALID_STATES:
                 return self._reply_error(reply, f"Invalid social state: {social_state}")
             
-            # Acquire lock (non-blocking)
+            # Acquire lock IMMEDIATELY before executing interaction
             if not self.run_lock.acquire(blocking=False):
                 self._log("WARNING", "Another interaction already in progress")
-                return self._reply_error(reply, "Another action is running", "busy")
+                return self._reply_error(reply, "Another action is running")
             
             try:
                 self.log_buffer = []
@@ -692,13 +698,25 @@ class InteractionManagerModule(yarp.RFModule):
 
     def _yarp_rpc(self, port: str, command: str, timeout: int = 10) -> str:
         """Execute YARP RPC command via subprocess (raises on failure)."""
-        cmd = f'echo "{command}" | yarp rpc {port}'
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-        
-        if result.returncode != 0:
-            raise RuntimeError(f"RPC failed: {port} :: {command} :: {result.stderr.strip()}")
-        
-        return result.stdout.strip()
+        try:
+            proc = subprocess.Popen(
+                ["yarp", "rpc", port],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            stdout, stderr = proc.communicate(input=command + "\n", timeout=timeout)
+            
+            if proc.returncode != 0:
+                raise RuntimeError(f"RPC failed: {port} :: {command} :: {stderr.strip()}")
+            
+            return stdout.strip()
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise RuntimeError(f"RPC timeout: {port} :: {command}")
+        except Exception as e:
+            raise RuntimeError(f"RPC error: {port} :: {command} :: {str(e)}")
 
     def _register_face(self, name: str, track_id: int) -> bool:
         """Register face with objectRecognition."""
@@ -823,9 +841,9 @@ class InteractionManagerModule(yarp.RFModule):
             self._log("ERROR", f"Database initialization failed: {e}")
 
     def _save_to_db(self, track_id: int, face_id: str, initial_state: str, result: dict):
-        """Save interaction result to database."""
+        """Save interaction result to database with error handling."""
         try:
-            conn = sqlite3.connect(self.DB_FILE)
+            conn = sqlite3.connect(self.DB_FILE, timeout=10.0)
             cursor = conn.cursor()
             
             # Extract high-level metrics
@@ -840,8 +858,12 @@ class InteractionManagerModule(yarp.RFModule):
             # Format transitions as comma-separated string
             transitions = ", ".join(result.get("transitions", []))
             
-            # Serialize full result to JSON
-            full_result_json = json.dumps(result, ensure_ascii=False)
+            # Serialize full result to JSON with error handling
+            try:
+                full_result_json = json.dumps(result, ensure_ascii=False)
+            except (TypeError, ValueError) as json_error:
+                self._log("WARNING", f"Could not serialize result to JSON: {json_error}")
+                full_result_json = json.dumps({"error": "serialization_failed", "success": success})
             
             cursor.execute('''
                 INSERT INTO interactions 
@@ -852,8 +874,30 @@ class InteractionManagerModule(yarp.RFModule):
             conn.commit()
             conn.close()
             self._log("INFO", f"Interaction saved to database: {initial_state} → {final_state}")
+        except sqlite3.Error as db_error:
+            self._log("ERROR", f"Database save failed (SQLite error): {db_error}")
+            # Try to save to fallback JSON file
+            self._save_to_fallback_log(track_id, face_id, initial_state, result)
         except Exception as e:
             self._log("ERROR", f"Database save failed: {e}")
+            self._save_to_fallback_log(track_id, face_id, initial_state, result)
+    
+    def _save_to_fallback_log(self, track_id: int, face_id: str, initial_state: str, result: dict):
+        """Fallback: save interaction to JSON file if database fails."""
+        try:
+            fallback_file = "interaction_fallback.json"
+            entries = self._load_json(fallback_file, [])
+            entries.append({
+                "timestamp": datetime.now().isoformat(),
+                "track_id": track_id,
+                "face_id": face_id,
+                "initial_state": initial_state,
+                "result": result
+            })
+            self._save_json(fallback_file, entries)
+            self._log("INFO", "Interaction saved to fallback log")
+        except Exception as e:
+            self._log("ERROR", f"Fallback save also failed: {e}")
 
     # ==================== JSON Persistence ====================
 
@@ -905,68 +949,208 @@ class InteractionManagerModule(yarp.RFModule):
 
     # ==================== LLM Integration ====================
 
-    def ensure_ollama_and_model(self) -> bool:
-        """Ensure Ollama is running and model is available."""
+    def _check_ollama_binary_exists(self) -> bool:
+        """Check if Ollama server binary is installed."""
+        paths = ["/usr/local/bin/ollama", "/usr/bin/ollama", "/opt/ollama/bin/ollama"]
+        for path in paths:
+            if os.path.exists(path):
+                self._log("INFO", f"Found Ollama binary at {path}")
+                return True
+        return False
+
+    def _install_ollama_server(self) -> bool:
+        """Install Ollama server if not present."""
         try:
+            self._log("INFO", "Ollama server not found. Installing...")
+            result = subprocess.run(
+                "curl -fsSL https://ollama.com/install.sh | sh",
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
+            if result.returncode == 0:
+                self._log("INFO", "Ollama server installed successfully")
+                return True
+            else:
+                self._log("ERROR", f"Ollama installation failed: {result.stderr}")
+                return False
+        except Exception as e:
+            self._log("ERROR", f"Failed to install Ollama: {e}")
+            return False
+
+    def _start_ollama_server(self) -> bool:
+        """Start Ollama server in background if not running."""
+        try:
+            # Check if already running
+            try:
+                req = urllib.request.Request(f"{self.OLLAMA_URL}/api/tags")
+                with urllib.request.urlopen(req, timeout=2) as resp:
+                    if resp.status == 200:
+                        self._log("INFO", "Ollama server already running")
+                        return True
+            except:
+                pass  # Server not running, will start it
+            
+            self._log("INFO", "Starting Ollama server...")
+            # Start in background, redirect output to log file
+            subprocess.Popen(
+                ["ollama", "serve"],
+                stdout=open("/tmp/ollama_server.log", "w"),
+                stderr=subprocess.STDOUT,
+                start_new_session=True
+            )
+            
+            # Wait for server to be ready (up to 30 seconds)
+            for i in range(30):
+                time.sleep(1)
+                try:
+                    req = urllib.request.Request(f"{self.OLLAMA_URL}/api/tags")
+                    with urllib.request.urlopen(req, timeout=2) as resp:
+                        if resp.status == 200:
+                            self._log("INFO", f"Ollama server started successfully (took {i+1}s)")
+                            return True
+                except:
+                    continue
+            
+            self._log("ERROR", "Ollama server failed to start within 30 seconds")
+            return False
+        except Exception as e:
+            self._log("ERROR", f"Failed to start Ollama server: {e}")
+            return False
+
+    def ensure_ollama_and_model(self) -> bool:
+        """Ensure Ollama server is installed, running, and model is available."""
+        try:
+            # Step 1: Check if Ollama binary exists, install if not
+            if not self._check_ollama_binary_exists():
+                self._log("WARNING", "Ollama binary not found, attempting installation...")
+                if not self._install_ollama_server():
+                    self._log("ERROR", "Could not install Ollama server. Please install manually: curl -fsSL https://ollama.com/install.sh | sh")
+                    return False
+            
+            # Step 2: Ensure Ollama server is running
+            if not self._start_ollama_server():
+                self._log("ERROR", "Could not start Ollama server")
+                return False
+            
+            # Step 3: Check if model is available, pull if not
             req = urllib.request.Request(f"{self.OLLAMA_URL}/api/tags")
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode())
                 models = [m.get("name", "") for m in data.get("models", [])]
                 
                 if not any(self.LLM_MODEL in m for m in models):
-                    self._log("INFO", f"Pulling model: {self.LLM_MODEL}")
-                    subprocess.run(f"ollama pull {self.LLM_MODEL}", shell=True, timeout=300)
+                    self._log("INFO", f"Model {self.LLM_MODEL} not found. Pulling... (this may take a few minutes)")
+                    result = subprocess.run(
+                        ["ollama", "pull", self.LLM_MODEL],
+                        capture_output=True,
+                        text=True,
+                        timeout=600
+                    )
+                    if result.returncode == 0:
+                        self._log("INFO", f"Model {self.LLM_MODEL} pulled successfully")
+                    else:
+                        self._log("ERROR", f"Failed to pull model: {result.stderr}")
+                        return False
+                else:
+                    self._log("INFO", f"Model {self.LLM_MODEL} already available")
+            
+            self.ollama_last_check = time.time()
+            self._log("INFO", "Ollama setup complete and ready")
             return True
         except Exception as e:
-            self._log("ERROR", f"Ollama check failed: {e}")
+            self._log("ERROR", f"Ollama setup failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def _check_ollama_health(self) -> bool:
+        """Quick health check for Ollama service."""
+        try:
+            req = urllib.request.Request(f"{self.OLLAMA_URL}/api/tags")
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                return resp.status == 200
+        except Exception:
             return False
 
     def _llm_request(self, prompt: str, json_format: bool = False) -> str:
-        """Send prompt to LLM, return response text."""
-        try:
-            payload = {"model": self.LLM_MODEL, "prompt": prompt, "stream": False}
-            if json_format:
-                payload["format"] = "json"
-            
-            data = json.dumps(payload).encode()
-            req = urllib.request.Request(
-                f"{self.OLLAMA_URL}/api/generate",
-                data=data,
-                headers={"Content-Type": "application/json"}
-            )
-            
-            with urllib.request.urlopen(req, timeout=self.LLM_TIMEOUT) as resp:
-                return json.loads(resp.read().decode()).get("response", "").strip()
-        except Exception as e:
-            self._log("ERROR", f"LLM request failed: {e}")
-            return ""
+        """Send prompt to LLM with retry logic, return response text."""
+        last_error = None
+        
+        for attempt in range(self.llm_retry_attempts):
+            try:
+                # Check Ollama health periodically
+                current_time = time.time()
+                if current_time - self.ollama_last_check > self.ollama_check_interval:
+                    if not self._check_ollama_health():
+                        self._log("WARNING", "Ollama health check failed, attempting anyway...")
+                    self.ollama_last_check = current_time
+                
+                payload = {"model": self.LLM_MODEL, "prompt": prompt, "stream": False}
+                if json_format:
+                    payload["format"] = "json"
+                
+                data = json.dumps(payload).encode()
+                req = urllib.request.Request(
+                    f"{self.OLLAMA_URL}/api/generate",
+                    data=data,
+                    headers={"Content-Type": "application/json"}
+                )
+                
+                with urllib.request.urlopen(req, timeout=self.LLM_TIMEOUT) as resp:
+                    result = json.loads(resp.read().decode()).get("response", "").strip()
+                    if result:  # Success
+                        if attempt > 0:
+                            self._log("INFO", f"LLM request succeeded on attempt {attempt + 1}")
+                        return result
+                    else:
+                        self._log("WARNING", f"LLM returned empty response (attempt {attempt + 1})")
+                        last_error = "Empty response from LLM"
+                        
+            except Exception as e:
+                last_error = str(e)
+                self._log("WARNING", f"LLM request failed (attempt {attempt + 1}/{self.llm_retry_attempts}): {e}")
+                if attempt < self.llm_retry_attempts - 1:
+                    time.sleep(self.llm_retry_delay)
+        
+        self._log("ERROR", f"LLM request failed after {self.llm_retry_attempts} attempts: {last_error}")
+        return ""
 
     def _llm_json(self, prompt: str) -> Dict:
         """Get JSON response from LLM with robust parsing."""
         text = self._llm_request(prompt, json_format=True)
         if not text:
+            self._log("ERROR", "LLM returned empty response - returning safe default")
             return {}
         
         # Extract JSON object
         start, end = text.find("{"), text.rfind("}")
         if start != -1 and end > start:
             try:
-                return json.loads(text[start:end+1])
-            except json.JSONDecodeError:
-                pass
+                result = json.loads(text[start:end+1])
+                # Validate result is actually a dict
+                if isinstance(result, dict):
+                    return result
+            except json.JSONDecodeError as e:
+                self._log("WARNING", f"JSON extraction failed: {e}")
         
         try:
-            return json.loads(text)
+            result = json.loads(text)
+            if isinstance(result, dict):
+                return result
+            else:
+                self._log("WARNING", f"LLM returned non-dict JSON: {type(result)}")
+                return {}
         except json.JSONDecodeError:
-            self._log("WARNING", f"LLM non-JSON: {text[:100]}")
+            self._log("ERROR", f"LLM non-JSON response: {text[:100]}...")
             return {}
 
     def _llm_detect_greeting_response(self, utterance: str) -> Dict:
         """Detect if utterance is a greeting response."""
-        prompt = f'''Instruction: Analyze if the English text is a greeting response (e.g., hello, hi, yes, hey).
+        prompt = f'''Does this text contain a greeting word like: hello, hi, hey, yes, yeah, sure, okay, good morning?
 Text: "{utterance}"
-Output ONLY a raw JSON object with this exact schema: {{"responded": true/false, "confidence": 0.0-1.0}}
-JSON:'''
+Answer only: {{"responded": true, "confidence": 1.0}} or {{"responded": false, "confidence": 0.0}}'''
         
         result = self._llm_json(prompt)
         return {
