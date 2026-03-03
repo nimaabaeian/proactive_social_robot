@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import qrcode
-from qrcode.constants import ERROR_CORRECT_H
+from qrcode.constants import ERROR_CORRECT_M
 
 # ---------------------------------------------------------------------------
 # Config
@@ -41,7 +41,7 @@ def build_qr(payload: str):
     """Build a QR image for *payload*."""
     qr = qrcode.QRCode(
         version=None,
-        error_correction=ERROR_CORRECT_H,
+        error_correction=ERROR_CORRECT_M,
         box_size=12,
         border=4,
     )
@@ -71,7 +71,7 @@ def verify_with_cv2(files: Dict[str, Path]) -> Tuple[Optional[bool], str]:
 
     detector = cv2.QRCodeDetector()
     for payload, path in files.items():
-        img = cv2.imread(str(path))
+        img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
         if img is None:
             return False, f"Cannot read image: {path}"
         decoded, _, _ = detector.detectAndDecode(img)
