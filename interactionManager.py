@@ -1,8 +1,10 @@
 """
 interactionManager.py – YARP RFModule for Social Interaction State Trees
 
-Uses Ollama LLM (Llama 3.2 3B Instruct) for natural language understanding
+Uses Azure OpenAI (via LangChain) for natural language understanding
 and generation.
+  • gpt5-nano → JSON / name extraction (deterministic)
+  • gpt5-mini → user-facing conversation responses
 
 Social States:
   ss1: unknown                 → greet, ask name, register
@@ -30,13 +32,18 @@ import re
 import os
 import queue
 import sqlite3
-import subprocess
 import tempfile
 import threading
 import time
-import urllib.request
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+
+from dotenv import load_dotenv
+load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(__file__), "memory", "llm.env"), override=False)
+
+from langchain_openai import AzureChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
 
 import yarp
 
@@ -100,10 +107,21 @@ class InteractionManagerModule(yarp.RFModule):
 
     # ==================== Constants ====================
 
-    OLLAMA_URL = "http://localhost:11434"
-    LLM_MODEL = "llama3.2:3b"
-    LLM_SYSTEM_DEFAULT = "You are a friendly social robot assistant. Be concise, natural, and polite. Follow the user/task instructions exactly."
-    LLM_SYSTEM_JSON = "You are a strict JSON generator for information extraction. Output ONLY a single JSON object. No extra text, no markdown, no code fences."
+    LLM_SYSTEM_DEFAULT = (
+        "You are a friendly social robot talking to a person face to face. "
+        "Output ONLY the text to speak aloud. No quotes, no markdown, no emojis. "
+        "Be warm, natural, and concise. Never give medical, legal, or therapeutic advice. "
+        "If the user says something unsafe, violent, or about self-harm, respond with a brief, "
+        "supportive, de-escalating line and gently suggest they talk to someone who can help. "
+        "Avoid repetition. Do not repeat the user's words back verbatim."
+    )
+    LLM_SYSTEM_JSON = (
+        "You are a strict JSON extraction engine. "
+        "Output ONLY a single valid JSON object. "
+        "No markdown, no code fences, no trailing text, no explanation. "
+        "If uncertain, set answered to false and name to null. "
+        "confidence must be a number between 0.0 and 1.0."
+    )
     DB_FILE = "/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/data_collection/interaction_manager.db"
     LAST_GREETED_FILE = "/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/last_greeted.json"
     GREETED_TODAY_FILE = "/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/greeted_today.json"
@@ -172,11 +190,13 @@ class InteractionManagerModule(yarp.RFModule):
         self._monitor_thread: Optional[threading.Thread] = None
         self._current_track_id: Optional[int] = None
 
+        # Azure LLM clients (initialised in configure via setup_azure_llms)
+        self.llm_extract: Optional[AzureChatOpenAI] = None
+        self.llm_chat:    Optional[AzureChatOpenAI] = None
+
         # Error recovery
         self.llm_retry_attempts = 3
         self.llm_retry_delay = 1.0
-        self.ollama_last_check = 0.0
-        self.ollama_check_interval = 60.0
 
         # DB queue
         self._db_queue: queue.Queue = queue.Queue()
@@ -192,7 +212,6 @@ class InteractionManagerModule(yarp.RFModule):
         self._last_scan_payload: Optional[str] = None
         self._feed_condition = threading.Condition()
         self._feed_wait_timeout_sec = 8.0
-        self._feed_timeout_behaviour = "right_there"
         self._meal_mapping = {
             "SMALL_MEAL": 10.0,
             "MEDIUM_MEAL": 25.0,
@@ -221,7 +240,6 @@ class InteractionManagerModule(yarp.RFModule):
 
             if rf.check("qr_cooldown_sec"):       self._qr_cooldown_sec       = rf.find("qr_cooldown_sec").asFloat64()
             if rf.check("feed_wait_timeout_sec"): self._feed_wait_timeout_sec = rf.find("feed_wait_timeout_sec").asFloat64()
-            if rf.check("feed_timeout_behaviour"): self._feed_timeout_behaviour = rf.find("feed_timeout_behaviour").asString()
 
             self.handle_port.open("/" + self.module_name)
 
@@ -265,7 +283,7 @@ class InteractionManagerModule(yarp.RFModule):
             self._responsive_thread = threading.Thread(target=self._responsive_loop, daemon=True)
             self._responsive_thread.start()
 
-            self.ensure_ollama_and_model()
+            self.setup_azure_llms()
             threading.Thread(target=self._generate_starter_background, daemon=True).start()
             threading.Thread(target=self._prewarm_rpc_connections, daemon=True).start()
 
@@ -789,6 +807,8 @@ class InteractionManagerModule(yarp.RFModule):
         
         meals_eaten = 0
         start_wait_ts = time.time()
+        timeouts = 0
+        max_timeouts = 2  # 1st: prompt, 2nd: abort
         
         while not self._check_abort(result):
             fed, payload, new_ts = self._wait_for_feed_since(start_wait_ts, feed_wait_timeout_sec)
@@ -808,11 +828,21 @@ class InteractionManagerModule(yarp.RFModule):
                 else:
                     self._speak_and_wait("I'm still hungry. Give me more please.")
                     start_wait_ts = new_ts
+                    timeouts = 0  # Reset timeout counter after successful feed
             else:
                 if self._check_abort(result):
                     break
+                
+                timeouts += 1
+                if timeouts >= max_timeouts:
+                    self._log("INFO", "Hunger tree: max timeouts reached, aborting")
+                    if not result.get("abort_reason"):
+                        result["abort_reason"] = "no_food_qr"
+                    break
+                
+                # First timeout: prompt user to look for food
+                self._speak_and_wait("Take a look around, you will find some food for me.")
                 start_wait_ts = time.time()
-                self._execute_behaviour(self._feed_timeout_behaviour)
         
         result["meals_eaten_count"] = meals_eaten
         if meals_eaten > 0:
@@ -1185,7 +1215,7 @@ class InteractionManagerModule(yarp.RFModule):
 
     def _try_extract_name(self, utterance: str) -> Optional[str]:
         # Fast regex check for common patterns
-        match = re.search(r"(?i)(?:my name is|my name's|i am|i'm|im|call me)\s+([a-z-]+)", utterance)
+        match = re.search(r"(?i)(?:my name is|my name's|i am|i'm|im|call me)\s+([a-z][a-z'\-]+)", utterance)
         if match:
              return match.group(1).title()
 
@@ -1613,98 +1643,99 @@ class InteractionManagerModule(yarp.RFModule):
 
     # ==================== LLM Integration ====================
 
-    def _check_ollama_binary_exists(self) -> bool:
-        for path in ["/usr/local/bin/ollama", "/usr/bin/ollama", "/opt/ollama/bin/ollama"]:
-            if os.path.exists(path):
-                return True
-        return False
+    def setup_llm(self, deployment_name: str, max_completion_tokens: int) -> AzureChatOpenAI:
+        """Instantiate an AzureChatOpenAI client for a given deployment.
 
-    def _install_ollama_server(self) -> bool:
-        try:
-            self._log("INFO", "Installing Ollama...")
-            r = subprocess.run(
-                "curl -fsSL https://ollama.com/install.sh | sh",
-                shell=True, capture_output=True, text=True, timeout=300
-            )
-            return r.returncode == 0
-        except Exception as e:
-            self._log("ERROR", f"Ollama install failed: {e}")
-            return False
+        Raises RuntimeError if required env vars are missing or empty.
+        Note: GPT-5 models only support temperature=1 (the default) — it is not passed.
+        """
+        # --- Read and validate env ---
+        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip().strip('"').strip("'")
+        if not endpoint:
+            raise RuntimeError("AZURE_OPENAI_ENDPOINT is not set or empty")
 
-    def _start_ollama_server(self) -> bool:
-        try:
-            try:
-                req = urllib.request.Request(f"{self.OLLAMA_URL}/api/tags")
-                with urllib.request.urlopen(req, timeout=2) as resp:
-                    if resp.status == 200:
-                        return True
-            except Exception:
-                pass
-            subprocess.Popen(["ollama", "serve"],
-                             stdout=open("/tmp/ollama_server.log", "w"),
-                             stderr=subprocess.STDOUT, start_new_session=True)
-            for i in range(30):
-                time.sleep(1)
-                try:
-                    req = urllib.request.Request(f"{self.OLLAMA_URL}/api/tags")
-                    with urllib.request.urlopen(req, timeout=2) as resp:
-                        if resp.status == 200:
-                            return True
-                except Exception:
-                    continue
-            return False
-        except Exception as e:
-            self._log("ERROR", f"Ollama start failed: {e}")
-            return False
+        # Normalize: strip full chat-completions path down to base resource URL
+        if "/openai/" in endpoint:
+            endpoint = endpoint.split("/openai/")[0]
+        endpoint = endpoint.rstrip("/")
 
-    def ensure_ollama_and_model(self) -> bool:
-        try:
-            if not self._check_ollama_binary_exists():
-                if not self._install_ollama_server():
-                    return False
-            if not self._start_ollama_server():
-                return False
-            req = urllib.request.Request(f"{self.OLLAMA_URL}/api/tags")
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode())
-                models = [m.get("name", "") for m in data.get("models", [])]
-                if not any(self.LLM_MODEL in m for m in models):
-                    subprocess.run(["ollama", "pull", self.LLM_MODEL],
-                                   capture_output=True, text=True, timeout=600)
-            self.ollama_last_check = time.time()
-            return True
-        except Exception as e:
-            self._log("ERROR", f"Ollama setup failed: {e}")
-            return False
+        api_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip().strip('"').strip("'")
+        if not api_key:
+            raise RuntimeError("AZURE_OPENAI_API_KEY is not set or empty")
 
-    def _llm_request(self, prompt: str, json_format: bool = False, system: Optional[str] = None, options: Optional[dict] = None, format_obj: Optional[object] = None) -> str:
+        api_version = (
+            os.getenv("OPENAI_API_VERSION", "").strip().strip('"').strip("'")
+            or os.getenv("AZURE_OPENAI_API_VERSION", "").strip().strip('"').strip("'")
+        )
+        if not api_version:
+            raise RuntimeError("OPENAI_API_VERSION (or AZURE_OPENAI_API_VERSION) is not set or empty")
+
+        if not deployment_name:
+            raise RuntimeError("deployment_name must not be empty")
+
+        return AzureChatOpenAI(
+            azure_endpoint=endpoint,
+            api_key=api_key,
+            api_version=api_version,
+            azure_deployment=deployment_name,
+            max_completion_tokens=max_completion_tokens,
+            request_timeout=self.LLM_TIMEOUT,
+        )
+
+    def setup_azure_llms(self) -> None:
+        """Create the two Azure ChatOpenAI clients."""
+        dep_nano = os.getenv("AZURE_DEPLOYMENT_GPT5_NANO", "contact-Yogaexperiment_gpt5nano")
+        dep_mini = os.getenv("AZURE_DEPLOYMENT_GPT5_MINI", "contact-Yogaexperiment_gpt5mini")
+
+        # nano: deterministic JSON / name extraction
+        self.llm_extract: AzureChatOpenAI = self.setup_llm(dep_nano, max_completion_tokens=2000)
+        # mini: user-facing conversational responses
+        self.llm_chat: AzureChatOpenAI    = self.setup_llm(dep_mini, max_completion_tokens=2000)
+
+        self._log("INFO", f"Azure LLMs ready \u2013 nano={dep_nano}, mini={dep_mini}")
+
+    def _llm_request(self, prompt: str, json_format: bool = False, system: Optional[str] = None,
+                     options: Optional[dict] = None, format_obj: Optional[object] = None) -> str:
+        """Send a prompt to the appropriate Azure deployment.
+
+        Routing: nano (llm_extract) is used when *any* of these hold:
+          - json_format is True
+          - format_obj is not None (used only for routing; JSON validated by _llm_json)
+          - the system prompt contains 'json' (case-insensitive)
+        Otherwise mini (llm_chat) is used.
+        """
+        # --- Route: only explicit extraction calls go to nano ---
+        is_json_task = json_format or (format_obj is not None)
+        base_llm = self.llm_extract if is_json_task else self.llm_chat
+
+        if base_llm is None:
+            self._log("ERROR", "LLM client not initialised \u2013 call setup_azure_llms() first")
+            return ""
+
+        # --- Per-call overrides (max_completion_tokens only; GPT-5 doesn't accept temperature) ---
+        overrides: Dict[str, Any] = {}
+        if options:
+            if "num_predict" in options:
+                overrides["max_completion_tokens"] = options["num_predict"]
+        runnable = base_llm.bind(**overrides) if overrides else base_llm
+
+        # --- Build messages ---
+        messages = []
+        if system:
+            messages.append(SystemMessage(content=system))
+        messages.append(HumanMessage(content=prompt))
+
         last_error = None
         for attempt in range(self.llm_retry_attempts):
             try:
-                t = time.time()
-                if t - self.ollama_last_check > self.ollama_check_interval:
-                    self.ollama_last_check = t
-                payload: Dict[str, Any] = {"model": self.LLM_MODEL, "prompt": prompt, "stream": False}
-                if system is not None:
-                    payload["system"] = system
-                if options is not None:
-                    payload["options"] = options
-                if format_obj is not None:
-                    payload["format"] = format_obj
-                elif json_format:
-                    payload["format"] = "json"
-                data = json.dumps(payload).encode()
-                req = urllib.request.Request(f"{self.OLLAMA_URL}/api/generate",
-                                             data=data,
-                                             headers={"Content-Type": "application/json"})
-                http_timeout = min(self.LLM_TIMEOUT, 10.0)
-                with urllib.request.urlopen(req, timeout=http_timeout) as resp:
-                    result = json.loads(resp.read().decode()).get("response", "").strip()
-                    if result:
-                        return result
-                    last_error = "Empty response"
+                resp = runnable.invoke(messages)
+                text = (resp.content or "").strip()
+                if text:
+                    return text
+                last_error = "Empty response"
             except Exception as e:
                 last_error = str(e)
+                self._log("WARNING", f"LLM attempt {attempt + 1}/{self.llm_retry_attempts} failed: {e}")
                 if attempt < self.llm_retry_attempts - 1:
                     time.sleep(self.llm_retry_delay)
         self._log("ERROR", f"LLM failed after {self.llm_retry_attempts} attempts: {last_error}")
@@ -1753,19 +1784,16 @@ class InteractionManagerModule(yarp.RFModule):
         return {"responded": False, "confidence": 0.0}
 
     def _llm_extract_name(self, utterance: str) -> Dict:
-        prompt = (f"Extract the explicitly stated name of the person speaking from the utterance.\n"
-                  f"Utterance: '{utterance}'\n"
-                  f"Rules:\n"
-                  f"1. If no name is explicitly stated, you MUST return answered=false and name=null.\n"
-                  f"2. Do NOT guess names from greetings or conversational filler.\n"
-                  f"3. If multiple names appear, pick the first explicitly self-referential name.\n"
-                  f"4. Preserve capitalization as a normal name (Title Case) in output.\n"
-                  f"Examples:\n"
-                  f"- \"Hi, I'm Robert\" -> {{\"answered\": true, \"name\": \"Robert\", \"confidence\": 1.0}}\n"
-                  f"- \"Hello there\" -> {{\"answered\": false, \"name\": null, \"confidence\": 0.0}}\n"
-                  f"- \"Call me Alice\" -> {{\"answered\": true, \"name\": \"Alice\", \"confidence\": 1.0}}\n"
-                  f"- \"Hey, how are you?\" -> {{\"answered\": false, \"name\": null, \"confidence\": 0.0}}\n"
-                  f"- \"Yes, I am Sarah and this is Bob.\" -> {{\"answered\": true, \"name\": \"Sarah\", \"confidence\": 1.0}}\n")
+        prompt = (
+            f"Utterance: \"{utterance}\"\n"
+            f"Extract the speaker's own name.\n"
+            f"- Look for patterns: \"my name is\", \"I'm\", \"call me\", \"I am\".\n"
+            f"- Name must be Title Case, single token preferred (hyphens/apostrophes OK).\n"
+            f"- If multiple names, pick the first self-referential one.\n"
+            f"- Never invent a name from greetings or filler.\n"
+            f"- If no name is stated: answered=false, name=null, confidence=0.0.\n"
+        )
+        # format_obj is passed for routing only; JSON is parsed by _llm_json
         schema = {
             "type": "object",
             "properties": {
@@ -1776,17 +1804,27 @@ class InteractionManagerModule(yarp.RFModule):
             "required": ["answered", "name", "confidence"],
             "additionalProperties": False
         }
-        r = self._llm_json(prompt, system=self.LLM_SYSTEM_JSON, options={"temperature": 0, "num_predict": 80}, format_obj=schema)
-        return {"answered": r.get("answered", False) is True,
-                "name": r.get("name") or None,
-                "confidence": float(r.get("confidence", 0) or 0)}
+        r = self._llm_json(
+            prompt,
+            system=self.LLM_SYSTEM_JSON,
+            options={"num_predict": 2000},
+            format_obj=schema,
+        )
+        conf = float(r.get("confidence", 0) or 0)
+        conf = max(0.0, min(1.0, conf))  # clamp: model may exceed [0, 1]
+        return {
+            "answered": r.get("answered", False) is True,
+            "name": r.get("name") or None,
+            "confidence": conf,
+        }
 
     def _llm_generate_convo_starter(self) -> str:
         text = self._llm_request(
-            "Generate a natural conversation starter. NO greetings. Ask ONE short question about their day or wellbeing. "
-            "Under 15 words. Output ONLY the sentence, NO quotes.",
+            "Ask ONE short, friendly question about the person's day or wellbeing. "
+            "6 to 12 words. No greeting, no name, no sensitive topics. "
+            "Output only the sentence.",
             system=self.LLM_SYSTEM_DEFAULT,
-            options={"temperature": 0.4, "num_predict": 40}
+            options={"num_predict": 2000}
         )
         return text.strip("\"'").strip() if text and len(text) < 150 else "How are you doing these days?"
 
@@ -1801,20 +1839,21 @@ class InteractionManagerModule(yarp.RFModule):
     def _llm_generate_followup(self, last_utterance: str, history: List[str]) -> str:
         text = self._llm_request(
             f"User said: '{last_utterance}'\n"
-            f"Generate a friendly, natural response. 1-2 sentences. Under 25 words. "
-            f"NO meta-commentary. Output ONLY the response, NO quotes.",
+            f"Respond in 1 sentence (2 max). 22 words or fewer. "
+            f"Reflect the user's sentiment. You may ask at most one short follow-up question. "
+            f"Output only the spoken text.",
             system=self.LLM_SYSTEM_DEFAULT,
-            options={"temperature": 0.5, "num_predict": 80}
+            options={"num_predict": 2000}
         )
         return text.strip("\"'").strip() if text and len(text) < 200 else "That's interesting!"
 
     def _llm_generate_closing_acknowledgment(self, last_utterance: str) -> str:
         text = self._llm_request(
             f"Person said: '{last_utterance}'\n"
-            f"Generate a warm acknowledgment. NO questions. Under 10 words. "
-            f"Output ONLY the acknowledgment, NO quotes.",
+            f"Warm acknowledgment. 4 to 8 words. No question mark. "
+            f"Output only the spoken text.",
             system=self.LLM_SYSTEM_DEFAULT,
-            options={"temperature": 0.4, "num_predict": 30}
+            options={"num_predict": 2000}
         )
         return text.strip("\"'").strip() if text and len(text) < 100 else "That's nice!"
 
