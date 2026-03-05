@@ -107,6 +107,10 @@ class InteractionManagerModule(yarp.RFModule):
 
     # ==================== Constants ====================
 
+    _PROMPTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts.json")
+    _im_prompts: Dict[str, Any] = {}
+
+    # Default fallback values (overridden by prompts.json at configure() time)
     LLM_SYSTEM_DEFAULT = (
         "You are a friendly social robot talking to a person face to face. "
         "Output ONLY the text to speak aloud. No quotes, no markdown, no emojis. "
@@ -122,6 +126,17 @@ class InteractionManagerModule(yarp.RFModule):
         "If uncertain, set answered to false and name to null. "
         "confidence must be a number between 0.0 and 1.0."
     )
+
+    @classmethod
+    def _load_im_prompts(cls) -> None:
+        """Load (or reload) interactionManager prompts from prompts.json."""
+        with open(cls._PROMPTS_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        cls._im_prompts = data.get("interactionManager", {})
+        if cls._im_prompts.get("system_default"):
+            cls.LLM_SYSTEM_DEFAULT = cls._im_prompts["system_default"]
+        if cls._im_prompts.get("system_json"):
+            cls.LLM_SYSTEM_JSON = cls._im_prompts["system_json"]
     DB_FILE = "/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/data_collection/interaction_manager.db"
     LAST_GREETED_FILE = "/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/last_greeted.json"
     GREETED_TODAY_FILE = "/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/greeted_today.json"
@@ -204,6 +219,7 @@ class InteractionManagerModule(yarp.RFModule):
 
         # Hunger and QR
         self.hunger = HungerModel()
+        self.hunger_port: Optional[yarp.BufferedPortBottle] = None  # output to telegramBot
         self.cam_left_port: Optional[yarp.BufferedPortImageRgb] = None
         self._qr_thread: Optional[threading.Thread] = None
         self._qr_stop_event = threading.Event()
@@ -227,6 +243,8 @@ class InteractionManagerModule(yarp.RFModule):
 
     def configure(self, rf: yarp.ResourceFinder) -> bool:
         try:
+            InteractionManagerModule._load_im_prompts()
+
             if rf.check("name"):
                 self.module_name = rf.find("name").asString()
             self.setName(self.module_name)
@@ -260,6 +278,13 @@ class InteractionManagerModule(yarp.RFModule):
                     self._log("ERROR", f"Failed to open port: {pn}")
                     return False
                 self._log("INFO", f"Port open: {pn}")
+
+            self.hunger_port = yarp.BufferedPortBottle()
+            hunger_pn = f"/{self.module_name}/hunger:o"
+            if not self.hunger_port.open(hunger_pn):
+                self._log("ERROR", f"Failed to open port: {hunger_pn}")
+                return False
+            self._log("INFO", f"Port open: {hunger_pn}")
 
             self._ensure_json_file(self.LAST_GREETED_FILE, {})
             self._ensure_json_file(self.GREETED_TODAY_FILE, {})
@@ -302,7 +327,8 @@ class InteractionManagerModule(yarp.RFModule):
         self._qr_stop_event.set()
         self._responsive_stop_event.set()
         self.handle_port.interrupt()
-        for port in [self.landmarks_port, self.stt_port, self.speech_port, self.cam_left_port]:
+        for port in [self.landmarks_port, self.stt_port, self.speech_port,
+                     self.cam_left_port, self.hunger_port]:
             if port:
                 port.interrupt()
         return True
@@ -322,7 +348,8 @@ class InteractionManagerModule(yarp.RFModule):
         if self._db_thread:
             self._db_thread.join(timeout=3.0)
         self.handle_port.close()
-        for port in [self.landmarks_port, self.stt_port, self.speech_port, self.cam_left_port]:
+        for port in [self.landmarks_port, self.stt_port, self.speech_port,
+                     self.cam_left_port, self.hunger_port]:
             if port:
                 port.close()
         if self._interaction_rpc:
@@ -337,6 +364,13 @@ class InteractionManagerModule(yarp.RFModule):
 
     def updateModule(self) -> bool:
         self.hunger.update()
+        # Publish current hunger state so telegramBot (and any other subscriber) can read it.
+        if self.hunger_port:
+            hs = self.hunger.get_state()
+            b  = self.hunger_port.prepare()
+            b.clear()
+            b.addString(hs)
+            self.hunger_port.write()
         return self._running
 
     # ==================== RPC Handler ====================
@@ -634,7 +668,7 @@ class InteractionManagerModule(yarp.RFModule):
 
         # 3) Ask name
         self._clear_stt_buffer()
-        self._speak("We have not met, what's your name?")
+        self._speak(self._im_prompts.get("ss1_ask_name", "We have not met, what's your name?"))
         if self._check_abort(result):
             return
 
@@ -651,7 +685,7 @@ class InteractionManagerModule(yarp.RFModule):
             if self._check_abort(result):
                 return
             self._clear_stt_buffer()
-            self._speak("Sorry, I didn't catch that. What's your name?")
+            self._speak(self._im_prompts.get("ss1_ask_name_retry", "Sorry, I didn't catch that. What's your name?"))
             name_utterance2 = self._wait_user_utterance_abortable(self.SS2_STT_TIMEOUT)
             if name_utterance2:
                 name = self._try_extract_name(name_utterance2)
@@ -675,7 +709,7 @@ class InteractionManagerModule(yarp.RFModule):
             daemon=True
         ).start()
 
-        self._speak_and_wait("Nice to meet you")
+        self._speak_and_wait(self._im_prompts.get("ss1_nice_to_meet", "Nice to meet you"))
 
         result["success"]     = True
         result["greeted"]     = True
@@ -705,7 +739,8 @@ class InteractionManagerModule(yarp.RFModule):
                 return
 
             self._clear_stt_buffer()
-            self._speak_and_wait(f"Hello {face_id}")
+            _greeting_tpl = self._im_prompts.get("ss2_greeting", "Hello {name}")
+            self._speak_and_wait(_greeting_tpl.format(name=face_id))
             result["greeted"] = True
 
             if self._check_abort(result):
@@ -740,7 +775,7 @@ class InteractionManagerModule(yarp.RFModule):
         if self._check_abort(result):
             return
 
-        starter = self._cached_starter or "How are you doing these days?"
+        starter = self._cached_starter or self._im_prompts.get("convo_starter_fallback", "How are you doing these days?")
         self._cached_starter = None
         threading.Thread(target=self._generate_starter_background, daemon=True).start()
 
@@ -776,7 +811,7 @@ class InteractionManagerModule(yarp.RFModule):
             else:
                 future = self._llm_pool.submit(self._llm_generate_followup, utterance, [])
 
-            default    = "That's nice!" if is_last else "I see."
+            default    = self._im_prompts.get("closing_ack_fallback", "That's nice!") if is_last else self._im_prompts.get("ss3_mid_turn_fallback", "I see.")
             reply_text = self._await_future_abortable(future, default, self.LLM_TIMEOUT)
 
             if reply_text is None:
@@ -803,7 +838,7 @@ class InteractionManagerModule(yarp.RFModule):
         feed_wait_timeout_sec = float(self._feed_wait_timeout_sec)
         
         self._clear_stt_buffer()
-        self._speak_and_wait("I'm so hungry, would you feed me please?")
+        self._speak_and_wait(self._im_prompts.get("hunger_ask_feed", "I'm so hungry, would you feed me please?"))
         
         meals_eaten = 0
         start_wait_ts = time.time()
@@ -819,14 +854,14 @@ class InteractionManagerModule(yarp.RFModule):
                 with self.hunger._lock:
                     lvl = self.hunger.level
                 self._log("INFO", f"Proactive feed: {payload} → meal #{meals_eaten}, stomach {lvl:.1f}")
-                self._speak_and_wait("Yummy, thank you so much.")
+                self._speak_and_wait(self._im_prompts.get("hunger_thank_feed", "Yummy, thank you so much."))
                 
                 new_hs = self.hunger.get_state()
                 if new_hs == "HS1":
                     self._log("INFO", "Hunger satisfied, ending feeding interaction.")
                     break
                 else:
-                    self._speak_and_wait("I'm still hungry. Give me more please.")
+                    self._speak_and_wait(self._im_prompts.get("hunger_still_hungry", "I'm still hungry. Give me more please."))
                     start_wait_ts = new_ts
                     timeouts = 0  # Reset timeout counter after successful feed
             else:
@@ -841,7 +876,7 @@ class InteractionManagerModule(yarp.RFModule):
                     break
                 
                 # First timeout: prompt user to look for food
-                self._speak_and_wait("Take a look around, you will find some food for me.")
+                self._speak_and_wait(self._im_prompts.get("hunger_look_around", "Take a look around, you will find some food for me."))
                 start_wait_ts = time.time()
         
         result["meals_eaten_count"] = meals_eaten
@@ -1113,7 +1148,7 @@ class InteractionManagerModule(yarp.RFModule):
                 self._log("INFO", f"Responsive QR ack: {meal_payload}")
             t = threading.Thread(target=self._execute_behaviour, args=("ao_start",), daemon=True)
             t.start()
-            self._responsive_speak_and_wait("yummy, thank you")
+            self._responsive_speak_and_wait(self._im_prompts.get("responsive_qr_ack_text", "yummy, thank you"))
             t.join(timeout=5.0)
             self._execute_behaviour("ao_stop")
             self._db_queue.put(("responsive", {
@@ -1137,7 +1172,8 @@ class InteractionManagerModule(yarp.RFModule):
             self._log("INFO", f"Responsive greeting: '{name}' (track={track_id})")
             t = threading.Thread(target=self._execute_behaviour, args=("ao_start",), daemon=True)
             t.start()
-            self._responsive_speak_and_wait(f"Hi {name}")
+            _greet_tpl = self._im_prompts.get("responsive_greeting", "Hi {name}")
+            self._responsive_speak_and_wait(_greet_tpl.format(name=name))
             t.join(timeout=5.0)
             self._execute_behaviour("ao_stop")
             self._write_last_greeted(track_id, face_id=name, code=name, person_key=name)
@@ -1784,15 +1820,16 @@ class InteractionManagerModule(yarp.RFModule):
         return {"responded": False, "confidence": 0.0}
 
     def _llm_extract_name(self, utterance: str) -> Dict:
-        prompt = (
-            f"Utterance: \"{utterance}\"\n"
-            f"Extract the speaker's own name.\n"
-            f"- Look for patterns: \"my name is\", \"I'm\", \"call me\", \"I am\".\n"
-            f"- Name must be Title Case, single token preferred (hyphens/apostrophes OK).\n"
-            f"- If multiple names, pick the first self-referential one.\n"
-            f"- Never invent a name from greetings or filler.\n"
-            f"- If no name is stated: answered=false, name=null, confidence=0.0.\n"
+        _tmpl = self._im_prompts.get(
+            "extract_name_prompt",
+            'Utterance: "{utterance}"\nExtract the speaker\'s own name.\n'
+            '- Look for patterns: "my name is", "I\'m", "call me", "I am".\n'
+            '- Name must be Title Case, single token preferred (hyphens/apostrophes OK).\n'
+            '- If multiple names, pick the first self-referential one.\n'
+            '- Never invent a name from greetings or filler.\n'
+            '- If no name is stated: answered=false, name=null, confidence=0.0.',
         )
+        prompt = _tmpl.format(utterance=utterance)
         # format_obj is passed for routing only; JSON is parsed by _llm_json
         schema = {
             "type": "object",
@@ -1819,14 +1856,15 @@ class InteractionManagerModule(yarp.RFModule):
         }
 
     def _llm_generate_convo_starter(self) -> str:
-        text = self._llm_request(
+        prompt = self._im_prompts.get(
+            "convo_starter_prompt",
             "Ask ONE short, friendly question about the person's day or wellbeing. "
             "6 to 12 words. No greeting, no name, no sensitive topics. "
             "Output only the sentence.",
-            system=self.LLM_SYSTEM_DEFAULT,
-            options={"num_predict": 2000}
         )
-        return text.strip("\"'").strip() if text and len(text) < 150 else "How are you doing these days?"
+        text = self._llm_request(prompt, system=self.LLM_SYSTEM_DEFAULT,
+                                 options={"num_predict": 2000})
+        return text.strip("\"'").strip() if text and len(text) < 150 else self._im_prompts.get("convo_starter_fallback", "How are you doing these days?")
 
     def _generate_starter_background(self):
         try:
@@ -1837,25 +1875,27 @@ class InteractionManagerModule(yarp.RFModule):
             self._log("WARNING", f"Starter prefetch failed: {e}")
 
     def _llm_generate_followup(self, last_utterance: str, history: List[str]) -> str:
-        text = self._llm_request(
-            f"User said: '{last_utterance}'\n"
-            f"Respond in 1 sentence (2 max). 22 words or fewer. "
-            f"Reflect the user's sentiment. You may ask at most one short follow-up question. "
-            f"Output only the spoken text.",
-            system=self.LLM_SYSTEM_DEFAULT,
-            options={"num_predict": 2000}
+        _tmpl = self._im_prompts.get(
+            "followup_prompt",
+            "User said: '{last_utterance}'\nRespond in 1 sentence (2 max). 22 words or fewer. "
+            "Reflect the user's sentiment. You may ask at most one short follow-up question. "
+            "Output only the spoken text.",
         )
-        return text.strip("\"'").strip() if text and len(text) < 200 else "That's interesting!"
+        prompt = _tmpl.format(last_utterance=last_utterance)
+        text = self._llm_request(prompt, system=self.LLM_SYSTEM_DEFAULT,
+                                 options={"num_predict": 2000})
+        return text.strip("\"'").strip() if text and len(text) < 200 else self._im_prompts.get("followup_fallback", "That's interesting!")
 
     def _llm_generate_closing_acknowledgment(self, last_utterance: str) -> str:
-        text = self._llm_request(
-            f"Person said: '{last_utterance}'\n"
-            f"Warm acknowledgment. 4 to 8 words. No question mark. "
-            f"Output only the spoken text.",
-            system=self.LLM_SYSTEM_DEFAULT,
-            options={"num_predict": 2000}
+        _tmpl = self._im_prompts.get(
+            "closing_ack_prompt",
+            "Person said: '{last_utterance}'\nWarm acknowledgment. 4 to 8 words. "
+            "No question mark. Output only the spoken text.",
         )
-        return text.strip("\"'").strip() if text and len(text) < 100 else "That's nice!"
+        prompt = _tmpl.format(last_utterance=last_utterance)
+        text = self._llm_request(prompt, system=self.LLM_SYSTEM_DEFAULT,
+                                 options={"num_predict": 2000})
+        return text.strip("\"'").strip() if text and len(text) < 100 else self._im_prompts.get("closing_ack_fallback", "That's nice!")
 
     # ==================== Helpers ====================
 
