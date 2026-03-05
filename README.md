@@ -356,6 +356,7 @@ Status overlay (top-left): `Status: BUSY | Faces: 2`
 | `/interactionManager/stt:i` | BufferedPortBottle | IN | Speech-to-text transcripts |
 | `/interactionManager/speech:o` | Port | OUT | TTS text → Acapela speaker |
 | `/interactionManager/camLeft:i` | BufferedPortImageRgb | IN | Camera for QR code reading |
+| `/interactionManager/hunger:o` | BufferedPortBottle | OUT | Current hunger state string (`HS1`/`HS2`/`HS3`) published at 1 Hz |
 
 **Lazy RPC Clients (created on first use):**
 
@@ -535,6 +536,31 @@ The responsive path handles **user-initiated events** that arise independently o
 **Request timeout:** `LLM_TIMEOUT = 60.0s`  
 **Retries:** 3 attempts with 1s delay
 
+**Prompt externalisation (`prompts.json`):** All LLM prompt templates _and_ fixed speech strings used by `interactionManager` are stored in `prompts.json` under the `"interactionManager"` key and loaded at `configure()` time via `_load_im_prompts()`. Each value has an in-code fallback so the module still works if the file is missing or a key is absent. The two system-prompt constants (`LLM_SYSTEM_DEFAULT`, `LLM_SYSTEM_JSON`) are also overridden from `prompts.json` when the corresponding keys are present.
+
+| `prompts.json` key | Used by |
+|---|---|
+| `system_default` | Default LLM system prompt for conversational calls |
+| `system_json` | System prompt for JSON extraction calls |
+| `extract_name_prompt` | LLM name-extraction prompt template (`{utterance}`) |
+| `convo_starter_prompt` | LLM conversation-starter generation prompt |
+| `followup_prompt` | LLM follow-up reply prompt template (`{last_utterance}`) |
+| `closing_ack_prompt` | LLM closing acknowledgment prompt template (`{last_utterance}`) |
+| `convo_starter_fallback` | Fallback starter when LLM fails |
+| `followup_fallback` | Fallback follow-up text |
+| `closing_ack_fallback` | Fallback closing text |
+| `ss3_mid_turn_fallback` | Mid-turn fallback text |
+| `ss1_ask_name` | SS1 ask-name utterance |
+| `ss1_ask_name_retry` | SS1 retry ask-name utterance |
+| `ss1_nice_to_meet` | SS1 closing "Nice to meet you" utterance |
+| `ss2_greeting` | SS2 greeting template (`{name}`) |
+| `hunger_ask_feed` | Hunger feed request utterance |
+| `hunger_thank_feed` | Post-feed thank-you utterance |
+| `hunger_still_hungry` | Still-hungry prompt |
+| `hunger_look_around` | Look-around prompt (first QR timeout) |
+| `responsive_qr_ack_text` | Responsive QR acknowledgment text |
+| `responsive_greeting` | Responsive greeting template (`{name}`) |
+
 **Required environment variables (validated at startup):**
 - `AZURE_OPENAI_ENDPOINT`
 - `AZURE_OPENAI_API_KEY`
@@ -561,9 +587,10 @@ The responsive path handles **user-initiated events** that arise independently o
 Futures are polled with `_await_future_abortable()` which checks `abort_event` every 100ms and can cancel the future early.
 
 **Startup:** On `configure()`, the module:
-1. Creates Azure clients via `setup_azure_llms()` (nano + mini)
-2. Pre-fetches a conversation starter in the background
-3. Pre-warms RPC connections (background thread sends `status` pings to avoid TCP setup latency on first interaction)
+1. Loads `prompts.json` via `_load_im_prompts()` (overrides hardcoded prompt constants)
+2. Creates Azure clients via `setup_azure_llms()` (nano + mini)
+3. Pre-fetches a conversation starter in the background
+4. Pre-warms RPC connections (background thread sends `status` pings to avoid TCP setup latency on first interaction)
 
 ### 4.11 Speech Output (TTS)
 
@@ -610,6 +637,8 @@ get_state() → "HS1" (≥60), "HS2" (≥25), "HS3" (<25)
 ```
 
 Thread-safe via internal `_lock`. Updated every `updateModule()` cycle (1 Hz).
+
+**Hunger broadcast port:** Each `updateModule()` cycle also writes the current hunger state string to `/interactionManager/hunger:o` (`BufferedPortBottle`). Any external module (e.g. a Telegram bot) can connect and read the hunger level in real time.
 
 ### 4.14 RPC Interface
 
@@ -786,7 +815,7 @@ RPC handle thread                → respond() (YARP managed)
 
 ## 8. Memory Files Reference
 
-All files under `modules/alwaysOn/memory/`:
+All files under `modules/alwaysOn/memory/` (plus `prompts.json` at the module root):
 
 | File | R/W | Owner | Description |
 |---|---|---|---|
@@ -794,6 +823,7 @@ All files under `modules/alwaysOn/memory/`:
 | `greeted_today.json` | R+W | faceSelector + interactionManager | ISO timestamps of today's greetings |
 | `talked_today.json` | R+W | faceSelector | ISO timestamps of today's talks |
 | `last_greeted.json` | R+W | interactionManager (write) / faceSelector (read) | Last greeting record per person |
+| `prompts.json` | R | interactionManager | All speech strings and LLM prompt templates; loaded once at `configure()`. Section key: `"interactionManager"`. Falls back to hardcoded defaults if absent. |
 
 ---
 
@@ -841,6 +871,9 @@ yarp connect /alwayson/vision/landmarks:o  /interactionManager/landmarks:i
 yarp connect /speech2text/text:o           /interactionManager/stt:i
 yarp connect /icub/cam/left                /interactionManager/camLeft:i
 yarp connect /interactionManager/speech:o  /acapelaSpeak/speech:i
+
+# Hunger state broadcast (subscribe from an external module, e.g. telegramBot)
+yarp connect /interactionManager/hunger:o  /telegramBot/hunger:i
 
 # RPC test
 echo "status" | yarp rpc /interactionManager
