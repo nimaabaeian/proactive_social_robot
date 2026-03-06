@@ -138,6 +138,7 @@ class InteractionManagerModule(yarp.RFModule):
         if cls._im_prompts.get("system_json"):
             cls.LLM_SYSTEM_JSON = cls._im_prompts["system_json"]
     DB_FILE = "/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/data_collection/interaction_manager.db"
+    TELEGRAM_DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory", "telegram_bot.db")
     LAST_GREETED_FILE = "/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/last_greeted.json"
     GREETED_TODAY_FILE = "/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/greeted_today.json"
 
@@ -762,6 +763,134 @@ class InteractionManagerModule(yarp.RFModule):
         result["abort_reason"] = "no_response_greeting"
         self._log("INFO", "SS2: failed after 2 attempts")
 
+    # ==================== Telegram User Lookup ====================
+
+    def _lookup_telegram_user(self, face_name: str) -> Optional[Dict[str, Any]]:
+        """Look up a face name in telegram_bot.db user_memory by name or nickname.
+
+        Matching is case-insensitive. Returns the parsed user record dict on
+        match, or None if the DB is missing / no match is found.
+        """
+        if not face_name or face_name.lower() in ("unknown", "unmatched", "recognizing"):
+            return None
+
+        db_path = self.TELEGRAM_DB_FILE
+        if not os.path.isfile(db_path):
+            self._log("DEBUG", f"Telegram DB not found: {db_path}")
+            return None
+
+        try:
+            conn = sqlite3.connect(db_path, timeout=5.0)
+            conn.execute("PRAGMA journal_mode=WAL")
+            rows = conn.execute("SELECT chat_id, data_json FROM user_memory").fetchall()
+            conn.close()
+        except Exception as e:
+            self._log("WARNING", f"Telegram DB read failed: {e}")
+            return None
+
+        face_lower = face_name.strip().lower()
+        best_record: Optional[Dict[str, Any]] = None
+
+        for _chat_id, data_json in rows:
+            try:
+                record = json.loads(data_json or "{}")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(record, dict):
+                continue
+
+            db_name = (record.get("name") or "").strip().lower()
+            db_nick = (record.get("nickname") or "").strip().lower()
+
+            if db_name and db_name == face_lower:
+                best_record = record
+                break  # exact name match — done
+            if db_nick and db_nick == face_lower:
+                best_record = record
+                break  # exact nickname match — done
+            # Partial: face_name is a first-name substring of the DB name
+            if db_name and face_lower in db_name.split():
+                best_record = record
+                # keep looking for an exact match
+            elif db_nick and face_lower in db_nick.split():
+                if best_record is None:
+                    best_record = record
+
+        if best_record:
+            self._log("INFO", f"Telegram user match for '{face_name}': "
+                      f"name={best_record.get('name')}, nick={best_record.get('nickname')}")
+        else:
+            self._log("DEBUG", f"No telegram user match for '{face_name}'")
+
+        return best_record
+
+    @staticmethod
+    def _build_face_user_context(record: Dict[str, Any]) -> str:
+        """Build a concise spoken-context string from a telegram user record.
+
+        Adapted from TelegramBotModule._build_user_context but tuned for
+        face-to-face interaction (no texting style, no emoji references).
+        Returns empty string if record has no useful data.
+        """
+        if not record or not isinstance(record, dict):
+            return ""
+
+        def _s(v: Any, mx: int = 60) -> str:
+            if not v or not isinstance(v, str):
+                return ""
+            return " ".join(v.split())[:mx]
+
+        def _sl(v: Any, mx: int = 5) -> List[str]:
+            if not isinstance(v, list):
+                return []
+            return [s for s in (_s(item) for item in v) if s][:mx]
+
+        parts: List[str] = []
+
+        name = _s(record.get("name"))
+        nickname = _s(record.get("nickname"))
+        age = record.get("age")
+        if name:
+            frag = f"Their name is {name}."
+            if nickname:
+                frag += f" They go by {nickname}."
+            if age and isinstance(age, int) and 5 <= age <= 120:
+                frag += f" They are {age} years old."
+            parts.append(frag)
+        elif age and isinstance(age, int) and 5 <= age <= 120:
+            parts.append(f"They are {age} years old.")
+
+        likes = _sl(record.get("likes"))
+        topics = _sl(record.get("favorite_topics"))
+        interests = list(dict.fromkeys(topics + likes))[:5]
+        if interests:
+            parts.append(f"They like: {', '.join(interests)}.")
+
+        dislikes = _sl(record.get("dislikes"), mx=3)
+        if dislikes:
+            parts.append(f"They dislike: {', '.join(dislikes)}.")
+
+        rel = _s(record.get("relationship_style"))
+        if rel:
+            parts.append(f"Relationship style: {rel}.")
+
+        update = _s(record.get("last_personal_update"), mx=80)
+        if update:
+            parts.append(f"Recent life update: {update}.")
+
+        jokes = _sl(record.get("inside_jokes"), mx=3)
+        if jokes:
+            parts.append(f"Inside joke: {jokes[-1]}.")
+
+        trust = _s(record.get("trust_level"))
+        if trust == "close_friend":
+            parts.append("They consider iCub a close friend.")
+
+        ctx = " ".join(parts)
+        if len(ctx) > 500:
+            ctx = ctx[:497].rsplit(" ", 1)[0] + "..."
+        return ctx
+
     # ==================== Tree SS3: Known, greeted, not talked ====================
 
     def _run_ss3_tree(self, track_id: int, face_id: str, result: Dict):
@@ -769,13 +898,39 @@ class InteractionManagerModule(yarp.RFModule):
         Short conversation with proactive starter.
         Up to 3 turns; turn 3 is acknowledgment only.
         If at least one response → talked=True → ss4.
+        If the person is known in the Telegram DB, their profile is used
+        to personalise the opening and follow-up LLM responses.
         """
         self._log("INFO", "SS3: start")
 
         if self._check_abort(result):
             return
 
-        starter = self._cached_starter or self._im_prompts.get("convo_starter_fallback", "How are you doing these days?")
+        # --- Telegram user lookup (best-effort, never blocks interaction) ---
+        user_context = ""
+        try:
+            tg_record = self._lookup_telegram_user(face_id)
+            if tg_record:
+                user_context = self._build_face_user_context(tg_record)
+                if user_context:
+                    self._log("INFO", f"SS3: personalised context ({len(user_context)} chars)")
+                    result["telegram_user_matched"] = True
+        except Exception as e:
+            self._log("WARNING", f"SS3: telegram lookup failed (continuing without): {e}")
+
+        # --- Opening line ---
+        # If we have user context, generate a personalised starter right now
+        # (the pre-cached generic starter won't use their data).
+        if user_context:
+            try:
+                starter = self._llm_generate_convo_starter(user_context=user_context)
+            except Exception:
+                starter = None
+            if not starter:
+                starter = self._cached_starter or self._im_prompts.get("convo_starter_fallback", "How are you doing these days?")
+        else:
+            starter = self._cached_starter or self._im_prompts.get("convo_starter_fallback", "How are you doing these days?")
+
         self._cached_starter = None
         threading.Thread(target=self._generate_starter_background, daemon=True).start()
 
@@ -807,9 +962,13 @@ class InteractionManagerModule(yarp.RFModule):
             is_last = turns >= self.SS3_MAX_TURNS
 
             if is_last:
-                future = self._llm_pool.submit(self._llm_generate_closing_acknowledgment, utterance)
+                future = self._llm_pool.submit(
+                    self._llm_generate_closing_acknowledgment, utterance,
+                    user_context=user_context)
             else:
-                future = self._llm_pool.submit(self._llm_generate_followup, utterance, [])
+                future = self._llm_pool.submit(
+                    self._llm_generate_followup, utterance, [],
+                    user_context=user_context)
 
             default    = self._im_prompts.get("closing_ack_fallback", "That's nice!") if is_last else self._im_prompts.get("ss3_mid_turn_fallback", "I see.")
             reply_text = self._await_future_abortable(future, default, self.LLM_TIMEOUT)
@@ -1855,44 +2014,72 @@ class InteractionManagerModule(yarp.RFModule):
             "confidence": conf,
         }
 
-    def _llm_generate_convo_starter(self) -> str:
-        prompt = self._im_prompts.get(
-            "convo_starter_prompt",
-            "Ask ONE short, friendly question about the person's day or wellbeing. "
-            "6 to 12 words. No greeting, no name, no sensitive topics. "
-            "Output only the sentence.",
-        )
+    def _llm_generate_convo_starter(self, user_context: str = "") -> str:
+        if user_context:
+            prompt = self._im_prompts.get(
+                "convo_starter_personalized_prompt",
+                "You know this about the person you're talking to:\n{user_context}\n\n"
+                "Ask ONE short, friendly question that shows you remember them. "
+                "6 to 14 words. Reference something you know about them if relevant. "
+                "No greeting, no sensitive topics. Output only the sentence.",
+            ).format(user_context=user_context)
+        else:
+            prompt = self._im_prompts.get(
+                "convo_starter_prompt",
+                "Ask ONE short, friendly question about the person's day or wellbeing. "
+                "6 to 12 words. No greeting, no name, no sensitive topics. "
+                "Output only the sentence.",
+            )
         text = self._llm_request(prompt, system=self.LLM_SYSTEM_DEFAULT,
                                  options={"num_predict": 2000})
         return text.strip("\"'").strip() if text and len(text) < 150 else self._im_prompts.get("convo_starter_fallback", "How are you doing these days?")
 
-    def _generate_starter_background(self):
+    def _generate_starter_background(self, user_context: str = ""):
         try:
-            starter = self._llm_generate_convo_starter()
+            starter = self._llm_generate_convo_starter(user_context=user_context)
             if starter:
                 self._cached_starter = starter
         except Exception as e:
             self._log("WARNING", f"Starter prefetch failed: {e}")
 
-    def _llm_generate_followup(self, last_utterance: str, history: List[str]) -> str:
-        _tmpl = self._im_prompts.get(
-            "followup_prompt",
-            "User said: '{last_utterance}'\nRespond in 1 sentence (2 max). 22 words or fewer. "
-            "Reflect the user's sentiment. You may ask at most one short follow-up question. "
-            "Output only the spoken text.",
-        )
-        prompt = _tmpl.format(last_utterance=last_utterance)
+    def _llm_generate_followup(self, last_utterance: str, history: List[str],
+                                user_context: str = "") -> str:
+        if user_context:
+            _tmpl = self._im_prompts.get(
+                "followup_personalized_prompt",
+                "You know this about the person:\n{user_context}\n\n"
+                "User said: '{last_utterance}'\nRespond in 1 sentence (2 max). 22 words or fewer. "
+                "Reflect the user's sentiment. Use what you know about them to make the response personal. "
+                "You may ask at most one short follow-up question. Output only the spoken text.",
+            )
+        else:
+            _tmpl = self._im_prompts.get(
+                "followup_prompt",
+                "User said: '{last_utterance}'\nRespond in 1 sentence (2 max). 22 words or fewer. "
+                "Reflect the user's sentiment. You may ask at most one short follow-up question. "
+                "Output only the spoken text.",
+            )
+        prompt = _tmpl.format(last_utterance=last_utterance, user_context=user_context)
         text = self._llm_request(prompt, system=self.LLM_SYSTEM_DEFAULT,
                                  options={"num_predict": 2000})
         return text.strip("\"'").strip() if text and len(text) < 200 else self._im_prompts.get("followup_fallback", "That's interesting!")
 
-    def _llm_generate_closing_acknowledgment(self, last_utterance: str) -> str:
-        _tmpl = self._im_prompts.get(
-            "closing_ack_prompt",
-            "Person said: '{last_utterance}'\nWarm acknowledgment. 4 to 8 words. "
-            "No question mark. Output only the spoken text.",
-        )
-        prompt = _tmpl.format(last_utterance=last_utterance)
+    def _llm_generate_closing_acknowledgment(self, last_utterance: str,
+                                                user_context: str = "") -> str:
+        if user_context:
+            _tmpl = self._im_prompts.get(
+                "closing_ack_personalized_prompt",
+                "You know this about the person:\n{user_context}\n\n"
+                "Person said: '{last_utterance}'\nWarm, personal acknowledgment. 4 to 10 words. "
+                "No question mark. Output only the spoken text.",
+            )
+        else:
+            _tmpl = self._im_prompts.get(
+                "closing_ack_prompt",
+                "Person said: '{last_utterance}'\nWarm acknowledgment. 4 to 8 words. "
+                "No question mark. Output only the spoken text.",
+            )
+        prompt = _tmpl.format(last_utterance=last_utterance, user_context=user_context)
         text = self._llm_request(prompt, system=self.LLM_SYSTEM_DEFAULT,
                                  options={"num_predict": 2000})
         return text.strip("\"'").strip() if text and len(text) < 100 else self._im_prompts.get("closing_ack_fallback", "That's nice!")
