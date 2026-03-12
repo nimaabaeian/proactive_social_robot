@@ -87,7 +87,7 @@ class FaceSelectorModule(yarp.RFModule):
     }
 
     LS_MIN_TIME_IN_VIEW = {
-        1: 3.0,
+        1: 2.0,
         2: 1.0,
     }
 
