@@ -1,5 +1,5 @@
 # Always On Cognitive Architecture — `Embodied Behaviour` 
-> **Modules:** `faceSelector.py` · `interactionManager.py`
+> **Modules:** `faceSelector.py` · `interactionManager.py` · `telegram_bot.py`
 > **Platform:** YARP (Yet Another Robot Platform)  
 > **Robot:** iCub
 > **Author:** Nima Abaeian
@@ -46,6 +46,19 @@
 8. [Memory Files Reference](#8-memory-files-reference)
 9. [Key Constants Reference](#9-key-constants-reference)
 10. [YARP Connection Commands](#10-yarp-connection-commands)
+11. [Module: `telegram_bot`](#11-module-telegram_bot)
+    - [Purpose](#111-purpose)
+    - [YARP Ports & RPC Interface](#112-yarp-ports--rpc-interface)
+    - [Message Handling](#113-message-handling)
+    - [Hunger-Aware Personality](#114-hunger-aware-personality)
+    - [HS3 Broadcast System](#115-hs3-broadcast-system)
+    - [User Memory & Personalization](#116-user-memory--personalization)
+    - [Conversation Memory](#117-conversation-memory)
+    - [LLM Integration](#118-llm-integration)
+    - [Database Schema](#119-database-schema)
+    - [Threading Architecture](#1110-threading-architecture)
+    - [Prompts (`prompts.json`)](#1111-prompts-promptsjson)
+    - [Key Constants](#1112-key-constants)
 
 ---
 
@@ -53,10 +66,11 @@
 
 The`Embodied Behaviour` Module in the `AlwaysOn Cognitive Architecture` system implements a **adaptive social interaction architecture** for the iCub robot. 
 
-The Embodied Behaviour has two tightly coupled modules:
+The Embodied Behaviour has three tightly coupled modules:
 
 | **`faceSelector`** |
 | **`interactionManager`** |
+| **`telegram_bot`** |
 ---
 
 ## 2. System Block Diagram
@@ -95,6 +109,18 @@ The Embodied Behaviour has two tightly coupled modules:
                  │ compact JSON result (success, final_state, abort...)
                  └──────────────────────────────► back to faceSelector
 
+                 │ hunger state (HS1/HS2/HS3) at 1 Hz
+                 │ /interactionManager/hunger:o
+                 v
+┌──────────────────────────────────────────────────────────────────────┐
+│ telegram_bot                                                         │
+│ - Chat with registered users via Telegram (Azure LLM replies)        │
+│ - Adapt personality to hunger state (HS1/HS2/HS3 overlays)          │
+│ - Broadcast HS3 starvation alerts to all subscribers                 │
+│ - Build per-user long-term memory (name, likes, inside jokes, etc.)  │
+│ - Persist user_memory → telegram_bot.db (read by interactionManager) │
+└──────────────────────────────────────────────────────────────────────┘
+
 ┌──────────────────────────────────────────────────────────────────────┐
 │ State Machines                                                       │
 │ - SS (Social): ss1 / ss2 / ss3 / ss4                                 │
@@ -109,10 +135,12 @@ The Embodied Behaviour has two tightly coupled modules:
 │ Shared Memory + Logs                                                 │
 │ - JSON memory (learning, greeted/talked, last_greeted)               │
 │ - SQLite logs (faceSelector + interactionManager records)            │
+│ - SQLite user/chat memory (telegram_bot.db)                          │
 └──────────────────────────────────────────────────────────────────────┘
 faceSelector ─────────────── read/write ───────────────┐
                                                         ├── memory
 interactionManager ───────── read/write ───────────────┘
+telegramBot ──────────────── read (user_memory) ───────┘
 
 ```
 ---
@@ -613,6 +641,7 @@ The responsive path handles **user-initiated events** that arise independently o
 | `followup_prompt` | LLM follow-up reply prompt template (`{last_utterance}`) |
 | `followup_personalized_prompt` | LLM follow-up prompt when Telegram user context is available (`{user_context}`, `{last_utterance}`) |
 | `closing_ack_prompt` | LLM closing acknowledgment prompt template (`{last_utterance}`) |
+| `closing_ack_personalized_prompt` | LLM closing acknowledgment when Telegram user context is available (`{user_context}`, `{last_utterance}`) |
 | `convo_starter_fallback` | Fallback starter when LLM fails |
 | `followup_fallback` | Fallback follow-up text |
 | `closing_ack_fallback` | Fallback closing text |
@@ -905,8 +934,8 @@ All files under `modules/alwaysOn/memory/` (plus `prompts.json` at the module ro
 | `greeted_today.json` | R+W | faceSelector + interactionManager | ISO timestamps of today's greetings |
 | `talked_today.json` | R+W | faceSelector | ISO timestamps of today's talks |
 | `last_greeted.json` | R+W | interactionManager (write) / faceSelector (read) | Last greeting record per person |
-| `prompts.json` | R | interactionManager | All speech strings and LLM prompt templates; loaded once at `configure()`. Section key: `"interactionManager"`. Falls back to hardcoded defaults if absent. |
-| `memory/telegram_bot.db` | R | interactionManager | Telegram bot's SQLite user-memory DB. Read-only by interactionManager; queried during SS3 for personalization. Optional — interaction continues normally if absent. |
+| `prompts.json` | R | interactionManager + telegram_bot | All speech strings and LLM prompt templates. Section `"interactionManager"` used by interactionManager (falls back to hardcoded defaults if absent). Section `"telegram_bot"` used by telegram_bot (hot-reloadable via `reload_prompts` RPC). |
+| `memory/telegram_bot.db` | R+W | telegram_bot (write) / interactionManager (read) | Telegram bot's SQLite DB. Contains `subscribers`, `chat_memory`, `user_memory`, and `meta` tables. `user_memory` is queried by interactionManager during SS3 for LLM personalization. Optional for interactionManager — interaction continues normally if absent. |
 
 ---
 
@@ -973,7 +1002,7 @@ yarp connect /speech2text/text:o           /interactionManager/stt:i
 yarp connect /icub/cam/left                /interactionManager/camLeft:i
 yarp connect /interactionManager/speech:o  /acapelaSpeak/speech:i
 
-# Hunger state broadcast (subscribe from an external module, e.g. telegramBot)
+# telegramBot
 yarp connect /interactionManager/hunger:o  /telegramBot/hunger:i
 
 # RPC test
@@ -982,4 +1011,250 @@ echo "run 3 Alice ss2" | yarp rpc /interactionManager
 
 # Manually override hunger level (for testing)
 echo "hunger hs3" | yarp rpc /interactionManager
+
+# telegramBot RPC
+echo "status"      | yarp rpc /telegramBot/rpc
+echo "set_hs HS3"  | yarp rpc /telegramBot/rpc
+echo "reload_prompts" | yarp rpc /telegramBot/rpc
 ```
+
+---
+
+## 11. Module: `telegram_bot`
+
+### 11.1 Purpose
+
+`telegram_bot` is the **remote companion channel** for the iCub robot. It runs as a YARP `RFModule` and exposes iCub as a Telegram chatbot, allowing registered users to chat with the robot from their phones at any time. It:
+
+- Subscribes to iCub's **hunger state** broadcast (`/interactionManager/hunger:o`) and adapts its conversation personality accordingly
+- Broadcasts **HS3 (starving) alerts** to all subscribers, begging them to come feed the robot in person
+- Maintains **per-user long-term memory** (name, age, likes, dislikes, inside jokes, trust level, etc.), continuously updating it from natural language cues in messages  
+- Mirrors that memory to `/memory/telegram_bot.db`, which `interactionManager` reads during SS3 in-person conversations for LLM personalization
+- Maintains **per-user conversation memory** (rolling history + periodic LLM-generated summaries) so the chatbot "remembers" past exchanges
+- Uses **Azure OpenAI** for all reply generation, with hunger-state-specific system prompt overlays
+- All speech strings and prompt templates are externalized to `prompts.json` under the `"telegram_bot"` key
+
+---
+
+### 11.2 YARP Ports & RPC Interface
+
+**YARP Ports:**
+
+| Port | Type | Direction | Purpose |
+|---|---|---|---|
+| `/{module}/hunger:i` | BufferedPortBottle | IN | Receives hunger state from `/interactionManager/hunger:o` |
+| `/{module}/rpc` | Port (RPC) | IN | Management commands (status, set_hs, reload_prompts) |
+
+Default `module_name = "telegramBot"`, overridable via `--name` flag.
+
+**RPC Commands:**
+
+| Command | Arguments | Returns |
+|---|---|---|
+| `status` | — | JSON object: `effective_hs`, `raw_hs`, `hs_stale`, `subscribers`, `tg_offset`, `tg_thread_alive`, `queue_size` |
+| `set_hs` | `HS1\|HS2\|HS3` | Set manual hunger override (bypasses staleness check) |
+| `reload_prompts` | — | Hot-reload `prompts.json` without restarting |
+
+---
+
+### 11.3 Message Handling
+
+All Telegram messages arrive via a **long-poll daemon thread** (`_tg_poll_loop`). Updates are queued and drained in `updateModule()` at up to **25 messages per cycle** (10 Hz).
+
+**Supported Telegram commands:**
+
+| Command | Behaviour |
+|---|---|
+| `/start` | Register subscriber, clear conversation history, send personalised greeting (uses stored name if known) |
+| `/reset` | Clear conversation history only (user memory kept) |
+| Any text | Full LLM-powered reply, with hunger overlay and user context |
+
+**Text message pipeline (`_on_text`):**
+```
+1. Upsert subscriber record and update last_seen_at
+2. Call _effective_hs() → choose hunger personality overlay
+3. Load chat memory (summary + rolling history) from DB
+4. Load user record and build a background-context system snippet
+5. Inject time context: current day/time and gap since last message
+6. Inject HS3 override system prompt if starving, else inject summary → history
+7. HS2: inject forced hunger comment if overdue (every HS2_HUNGER_EVERY_N messages)
+8. Call _llm_chat(messages) → send reply to Telegram
+9. Append turn to history; if SUMMARY_EVERY_TURNS reached → re-summarize via LLM
+10. Persist updated memory to DB
+```
+
+---
+
+### 11.4 Hunger-Aware Personality
+
+The bot's personality adapts to the robot's current hunger state:
+
+| HS | Behaviour |
+|---|---|
+| `HS1` (≥ 60 % — satisfied) | Normal friendly chat using `base_system_prompt` |
+| `HS2` (25–60 % — hungry) | Normal chat but slips casual hunger side-comments in every `HS2_HUNGER_EVERY_N` messages via `hs2_force_hunger_system` overlay |
+| `HS3` (< 25 % — starving) | Full `hs3_override_system` override: every reply pivots back to begging the user to come feed the robot in person (panicked / emotional tone) |
+
+**Staleness guard:** If the hunger port has not received an update for `HS_STALE_SEC = 60 s`, `_effective_hs()` silently falls back to `HS1` regardless of the last received state.
+
+---
+
+### 11.5 HS3 Broadcast System
+
+When `_effective_hs()` **enters** HS3, all subscribers receive an LLM-generated broadcast message immediately. During sustained HS3, periodic re-broadcasts are sent using per-subscriber cooldowns.
+
+```
+_maybe_hs3_broadcast() — called every updateModule() cycle:
+  ├─ effective_hs != HS3 → return
+  ├─ entering HS3 (prev != HS3):
+  │    → broadcast to ALL subscribers (no cooldown check)
+  └─ sustained HS3:
+       → broadcast only to subscribers whose last_broadcast_at
+         was > HS3_BROADCAST_COOLDOWN_SEC (30 min) ago
+         AND who have not chatted in the last HS3_SKIP_RECENT_SEC (10 min)
+
+Broadcast message:
+  → _llm_hs3_broadcast() using hs3_broadcast_system + hs3_broadcast_user prompts
+  → Falls back to hs3_broadcast_fallback string if LLM fails
+```
+
+---
+
+### 11.6 User Memory & Personalization
+
+`user_memory` is a per-user dict (keyed by Telegram `chat_id`) stored in `memory/telegram_bot.db`. It is read by `interactionManager` during SS3 face-to-face conversations for LLM personalization.
+
+**Fields extracted passively from message content and metadata:**
+
+| Field | How extracted |
+|---|---|
+| `name` | Telegram `from.first_name` on first message; also regex patterns `"my name is X"`, `"call me X"`, etc. |
+| `nickname` | Regex: `"you can call me X"`, `"my nickname is X"`, `"everyone calls me X"`, etc. |
+| `age` | Regex: `"I'm 23"`, `"just turned 23"`, `"turning 30 soon"`, `"I'll be 25 next month"`, etc. |
+| `likes` | Regex: `"I like/love/enjoy/adore X"`, `"I'm a fan of X"`, `"my favourite is X"`, etc. (max 3; FIFO on overflow) |
+| `dislikes` | Regex: `"I hate X"`, `"can't stand X"`, `"not a fan of X"`, etc. (max 5) |
+| `favorite_topics` | Regex: `"I'm into X"`, `"I love talking about X"`, `"I nerd out about X"`, etc. (max 5) |
+| `last_personal_update` | Regex: life events (`I'm sick`, `I just got promoted`, `my exam is today`, etc.) — max 120 chars |
+| `conversation_style` | Derived from message length (short/medium/long), presence of emoji, presence of playful slang |
+| `relationship_style` | Set to `"protective"` on empathy signals (`"poor iCub"`, `"are you ok"`, etc.) |
+| `inside_jokes` | References that appear **≥ 2 times** across separate messages (`"remember when we..."`, `"the X thing"`, etc.). Unconfirmed candidates expire after 30 days. Max 20 pending candidates, max 5 confirmed jokes. |
+| `trust_level` | Escalates from `"friend"` → `"close_friend"` on explicit trust signals (`"I've never told anyone"`, `"you really get me"`, etc.) |
+
+**Migration:** On startup, if `memory/user_memory.json` exists it is imported into the DB once and renamed to `user_memory.json.migrated`.
+
+**Normalization for matching** (`_normalize_for_matching`):
+- Smart/curly apostrophes → plain ASCII `'`
+- 3+ consecutive identical chars collapsed (`loooove` → `love`)
+- Multi-whitespace collapsed to single space
+
+---
+
+### 11.7 Conversation Memory
+
+Per-user conversation state is stored in the `chat_memory` table:
+
+| Field | Description |
+|---|---|
+| `summary` | LLM-generated summary of past conversation (max 400 chars); re-generated every `SUMMARY_EVERY_TURNS = 8` turns |
+| `messages_json` | Rolling window of last `MAX_HISTORY_TURNS × 2 = 20` messages (user + assistant pairs), each with a Unix timestamp |
+| `turn_count` | Total turns seen since last `/reset` |
+
+Each user message in history is prefixed with a compact timestamp label (e.g. `[Mon 6 Mar 2026, 11:42 PM, CET]`) injected by `_format_history_label()` when building the LLM messages list. A time-gap note (`"Their previous message was 3 days ago"`) is also injected as a system message to give the LLM temporal awareness.
+
+---
+
+### 11.8 LLM Integration
+
+**Backend:** Azure OpenAI via the `openai` Python SDK (`AzureOpenAI`)
+
+**Env loading order:** `memory/llm.env` then `.env` (both `override=False`)
+
+**Deployment selection (in priority order):**
+1. `AZURE_DEPLOYMENT_GPT5_MINI`
+2. `AZURE_OPENAI_DEPLOYMENT`
+3. `AZURE_DEPLOYMENT`
+4. Hard default: `"gpt5-mini"`
+
+**Max tokens:** `TELEGRAM_LLM_MAX_TOKENS` env var (default `4000`). Automatically falls back from `max_completion_tokens` to `max_tokens` if the endpoint rejects the parameter.
+
+**Retries:** 3 attempts with exponential back-off (`0.6 × 2ⁿ s`) on `APIConnectionError`, `APITimeoutError`, `RateLimitError`.
+
+| LLM Function | Purpose |
+|---|---|
+| `_llm_chat(messages)` | General-purpose chat completion (all reply types) |
+| `_llm_summarize(history, user_record)` | Generate compact conversation summary; anchors known facts (name, likes) so they are never dropped |
+| `_llm_hs3_broadcast()` | Generate a one-off starving-alert broadcast message |
+
+---
+
+### 11.9 Database Schema
+
+**File:** `memory/telegram_bot.db` (WAL mode, 5 s busy timeout)
+
+| Table | Description |
+|---|---|
+| `meta` | Key-value store (currently used to persist `tg_offset` across restarts) |
+| `subscribers` | One row per Telegram user who sent `/start`: `chat_id`, `started_at`, `last_seen_at`, `last_broadcast_at` |
+| `chat_memory` | Per-user conversation memory: `summary`, `messages_json`, `turn_count`, `updated_at` |
+| `user_memory` | Per-user long-term profile (JSON blob): name, age, likes, dislikes, inside jokes, trust level, etc. Read by `interactionManager` for SS3 personalization |
+
+---
+
+### 11.10 Threading Architecture
+
+```
+Main thread (updateModule @ 10Hz)
+  ├─ _read_hunger()             → drains /hunger:i port (non-blocking)
+  ├─ _process_tg_updates()      → drains tg_updates queue (max 25 per cycle),
+  │                               calls _handle_update() synchronously
+  └─ _maybe_hs3_broadcast()     → fires HS3 alert messages if needed
+
+RPC handle thread               → respond() (YARP managed)
+
+_tg_poll_loop (daemon thread)
+  └─ Long-polls Telegram getUpdates every 20 s
+     Pushes updates into tg_updates queue (drops oldest on overflow)
+```
+
+Note: LLM calls in `_on_text()` are **synchronous** — the main thread blocks on the Azure API response. In typical deployments this is acceptable because user messages arrive infrequently; for high-throughput scenarios a future refactor could off-load to a worker thread pool.
+
+---
+
+### 11.11 Prompts (`prompts.json`)
+
+All strings are under the `"telegram_bot"` key in `prompts.json`. Loaded once at `configure()` time; hot-reloadable via `reload_prompts` RPC.
+
+| Key | Used by |
+|---|---|
+| `base_system_prompt` | Base system personality for all LLM calls |
+| `hs_overlays.HS1` / `HS2` / `HS3` | Hunger-state-specific system prompt appended to base |
+| `hs3_override_system` | Full system override injected in HS3 per-message calls |
+| `hs2_force_hunger_system` | Injected when HS2 hunger comment is overdue |
+| `summary_injection` | Template wrapping the conversation summary (placeholder: `{summary}`) |
+| `summarize_system` | System prompt for the summarization call |
+| `hs3_broadcast_system` / `hs3_broadcast_user` | System + user prompts for HS3 broadcast generation |
+| `hs3_broadcast_fallback` | Fallback broadcast text when LLM fails |
+| `fallback_hs3` / `fallback_hs2` / `fallback_default` | Per-HS fallback reply when LLM fails |
+| `start_greeting_with_name` | `/start` greeting when name is known (placeholder: `{name}`) |
+| `start_greeting` | `/start` greeting when name is unknown |
+| `reset_reply` | Reply sent after `/reset` |
+
+---
+
+### 11.12 Key Constants
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `MODULE_HZ` | 10.0 | Main loop rate |
+| `HS_STALE_SEC` | 60.0 s | Declare hunger reading stale if no update within this window |
+| `TG_POLL_TIMEOUT_SEC` | 20 s | Telegram long-poll timeout per request |
+| `TG_HTTP_TIMEOUT_SEC` | 35 s | HTTP request timeout |
+| `MAX_HISTORY_TURNS` | 10 | Rolling message window size (in turns; 20 messages) |
+| `SUMMARY_EVERY_TURNS` | 8 | Regenerate conversation summary every N turns |
+| `MAX_USER_CHARS` | 500 | Truncate incoming message at this length |
+| `MAX_REPLY_CHARS` | 4096 | Telegram message limit; long replies are chunked |
+| `HS3_BROADCAST_COOLDOWN_SEC` | 1800 s | Per-subscriber cooldown for sustained HS3 re-broadcasts |
+| `HS3_SKIP_RECENT_SEC` | 600 s | Skip HS3 re-broadcast if subscriber chatted within this window |
+| `JOKE_CANDIDATE_TTL_SEC` | 30 days | Expire unconfirmed inside-joke candidates after this period |
+| `JOKE_CANDIDATE_MAX` | 20 | Max pending inside-joke candidates per user |
+| `HS2_HUNGER_EVERY_N` | 3 | Force a hunger side-comment after N messages without one (HS2) |
