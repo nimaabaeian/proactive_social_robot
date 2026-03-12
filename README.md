@@ -562,23 +562,19 @@ The **QR reader** runs in its own daemon thread (`_qr_reader_loop`), reading fro
 
 ### 4.9 Target Monitor
 
-A dedicated thread runs **alongside every interaction** (at 15 Hz) checking that the interaction target remains:
-1. **Still visible** in the landmarks stream
-2. **Still the biggest-bbox face**
+A dedicated thread runs **alongside every interaction** (at 15 Hz) checking that the interaction target remains **visible** in the landmarks stream. Displacement logic has been removed — the only abort criterion is whether the face with the given `track_id` is present.
 
 ```
 _target_monitor_loop(track_id, result):
   Loop at 15 Hz:
-    ├─ Parse latest landmarks
+    ├─ Parse latest landmarks (staleness_sec=5.0 — brief port hiccups ignored)
     ├─ Find face with track_id
     ├─ If found:
-    │    └─ If another face is now biggest → ABORT: target_not_biggest
+    │    └─ Reset last_seen timer
     └─ If not found:
-         └─ Wait TARGET_LOST_TIMEOUT (3.0s)
+         └─ Wait TARGET_LOST_TIMEOUT (12.0s)
          └─ Still missing → ABORT: target_lost
 ```
-
-**Starvation guard:** If the monitor thread was blocked for >1.5s (GIL starvation), it resets its lost-timer silently to avoid false aborts.
 
 Abort reasons cascade: the monitor sets `abort_event`, which every STT wait loop, speak-and-wait, and LLM future poll checks.
 
@@ -590,7 +586,7 @@ The responsive path handles **user-initiated events** that arise independently o
 - **Trigger:** User says `"hello"`, `"hi"`, `"ciao"`, `"good morning"` (matched by regex word boundary search)
 - **Condition:** Biggest-bbox known face (no gaze requirement—utterance itself is sufficient signal)
 - **Cooldown:** 10 seconds per name
-- **Action:** Say `"Hi <name>"` + write `last_greeted`
+- **Action:** Say `"Hi <name>"` + write `last_greeted`; then wait `SS3_STT_TIMEOUT` for a follow-up utterance. If one is received, enter a full **SS3-style conversation loop** (up to `SS3_MAX_TURNS` turns, with optional Telegram personalisation). The `abort_event` is cleared before the follow-up wait so landmark-monitor leftovers from a prior proactive interaction do not cut the conversation short.
 
 #### Responsive QR Acknowledgment
 - **Trigger:** QR scan detected (outside of a proactive interaction)
@@ -638,12 +634,14 @@ The responsive path handles **user-initiated events** that arise independently o
 - `OPENAI_API_VERSION` (or `AZURE_OPENAI_API_VERSION`)
 
 **Deployments (with defaults):**
-- `AZURE_DEPLOYMENT_GPT5_NANO` → `contact-Yogaexperiment_gpt5nano` (JSON/name extraction)
-- `AZURE_DEPLOYMENT_GPT5_MINI` → `contact-Yogaexperiment_gpt5mini` (conversation text generation)
+- `AZURE_DEPLOYMENT_GPT5_NANO` → `contact-Yogaexperiment_gpt5nano` (all tasks — JSON extraction, name extraction, and conversation)
+
+> `AZURE_DEPLOYMENT_GPT5_MINI` is no longer used; both `llm_extract` and `llm_chat` clients now point to the same `gpt5-nano` deployment.
 
 **Routing and options:**
-- `_llm_json(...)` requests route to the `gpt5-nano` client.
-- Conversational generation routes to the `gpt5-mini` client.
+- `_llm_json(...)` requests route to the `llm_extract` client (nano).
+- Conversational generation routes to the `llm_chat` client (also nano).
+- Routing logic is preserved for forward-compatibility (can be re-split later).
 - `options["num_predict"]` is mapped to `max_completion_tokens`.
 - Temperature is not passed (GPT-5 deployment constraint in code comments).
 
@@ -659,7 +657,7 @@ Futures are polled with `_await_future_abortable()` which checks `abort_event` e
 
 **Startup:** On `configure()`, the module:
 1. Loads `prompts.json` via `_load_im_prompts()` (overrides hardcoded prompt constants)
-2. Creates Azure clients via `setup_azure_llms()` (nano + mini)
+2. Creates Azure clients via `setup_azure_llms()` (both pointing to nano)
 3. Pre-fetches a conversation starter in the background
 4. Pre-warms RPC connections (background thread sends `status` pings to avoid TCP setup latency on first interaction)
 
@@ -700,14 +698,18 @@ _wait_user_utterance_abortable(timeout):
 Simulates the robot's "hunger" as a level from 0–100:
 
 ```python
-HungerModel(drain_hours=6.0, hungry_threshold=60.0, starving_threshold=25.0)
+HungerModel(drain_hours=5.0, hungry_threshold=60.0, starving_threshold=25.0,
+            log_callback=None)
 
 update()  → decrements level based on elapsed time (drains to 0 in drain_hours)
+          → calls log_callback("DEBUG", "Hunger: <N>%") each time level drops by 1%
 feed(delta, payload) → increments level (capped at 100)
 get_state() → "HS1" (≥60), "HS2" (≥25), "HS3" (<25)
 ```
 
 Thread-safe via internal `_lock`. Updated every `updateModule()` cycle (1 Hz).
+
+**Logging:** The new optional `log_callback` parameter accepts a callable `(level: str, msg: str) → None`. When provided, `HungerModel.update()` fires a `DEBUG` log entry each time the integer percentage drops by 1 point, enabling fine-grained hunger tracking in the module log. `InteractionManagerModule` wires its own `_log` method as the callback.
 
 **Hunger broadcast port:** Each `updateModule()` cycle also writes the current hunger state string to `/interactionManager/hunger:o` (`BufferedPortBottle`). Any external module (e.g. a Telegram bot) can connect and read the hunger level in real time.
 
@@ -722,7 +724,7 @@ The module exposes an RPC handle at `/interactionManager`.
 | `run` | `<track_id> <face_id> <ss1\|ss2\|ss3\|ss4>` | Compact JSON result |
 | `hunger` | `<hs1\|hs2\|hs3>` | Manually set hunger level (hs1=100 %, hs2=59 %, hs3=24 %) |
 | `status` / `ping` | — | `{"success":true, "busy":<bool>, ...}` |
-| `help` | — | Command list |
+| `help` | — | Plain-text command list (one line per command, not JSON) |
 | `quit` | — | Shutdown |
 
 **Concurrency:** `run_lock` (non-blocking acquire) ensures only one interaction runs at a time. If busy, returns `{"error": "Another action is running"}`.
@@ -748,9 +750,12 @@ The module exposes an RPC handle at `/interactionManager`.
 
 `telegram_user_matched` is set to `true` only when an SS3 interaction successfully looked up and used a Telegram user profile for personalization.
 
-**Abort reason compaction:**
-- `target_lost` / `target_not_biggest` / `target_monitor_abort` → `"face_disappeared"`
-- Anything else → `"not_responded"`
+**Abort reason compaction (applied only when the user never spoke):**
+- `target_lost` / `target_not_biggest` / `target_monitor_abort` → `"face_disappeared"` (only if `result["talked"]` is falsy)
+- Anything else → `"not_responded"` (only if `result["talked"]` is falsy)
+- If the user *did* speak (`result["talked"] = True`), no negative abort reason is recorded.
+
+**Success compaction:** `compact_success` is `True` when the interaction explicitly succeeded **or** when the user talked and no abort reason was recorded.
 
 ### 4.16 Database
 
@@ -947,7 +952,7 @@ All files under `modules/alwaysOn/memory/` (plus `prompts.json` at the module ro
 | `SS3_MAX_TIME` | 120.0s | Defined SS3 total-time cap (currently not enforced in loop) |
 | `LLM_TIMEOUT` | 60.0s | Maximum LLM wait |
 | `MONITOR_HZ` | 15.0 | Target monitor polling rate |
-| `TARGET_LOST_TIMEOUT` | 8.0s | Grace period before declaring target lost |
+| `TARGET_LOST_TIMEOUT` | 12.0s | Seconds track_id must be continuously absent before declaring target lost |
 | `RESPONSIVE_GREET_COOLDOWN_SEC` | 10.0s | Per-name cooldown for reactive greetings |
 | `TTS_WORDS_PER_SECOND` | 3.0 | Used to estimate speech duration |
 
