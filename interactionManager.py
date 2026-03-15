@@ -1233,12 +1233,16 @@ class InteractionManagerModule(yarp.RFModule):
                     self._log("DEBUG", "Responsive: no candidate found, skipping")
                     continue
 
-                track_id, name = candidate
-                if self._is_greet_in_responsive_cooldown(name):
-                    self._log("DEBUG", f"Responsive: '{name}' in cooldown, skipping")
+                track_id, face_id, is_known = candidate
+                cooldown_key = face_id if is_known else f"unknown:{track_id}"
+                if self._is_greet_in_responsive_cooldown(cooldown_key):
+                    self._log("DEBUG", f"Responsive: '{cooldown_key}' in cooldown, skipping")
                     continue
 
-                self._run_responsive_greeting(track_id, name)
+                if is_known:
+                    self._run_responsive_greeting(track_id, face_id)
+                else:
+                    self._run_responsive_unknown_intro(track_id, face_id)
             except Exception as e:
                 self._log("WARNING", f"Responsive loop iteration failed: {e}")
                 time.sleep(0.05)
@@ -1279,12 +1283,12 @@ class InteractionManagerModule(yarp.RFModule):
             return False
         return True
 
-    def _responsive_single_candidate(self) -> Optional[Tuple[int, str]]:
+    def _responsive_single_candidate(self) -> Optional[Tuple[int, str, bool]]:
         """Find the best candidate for responsive greeting.
 
-        Returns the biggest-bbox known face. Gaze/attention is NOT required —
-        the utterance itself is sufficient signal that the person is addressing
-        the robot.
+        Returns the biggest-bbox face as (track_id, face_id, is_known).
+        Gaze/attention is NOT required — the utterance itself is sufficient
+        signal that the person is addressing the robot.
         """
         with self._faces_lock:
             age = time.time() - self._latest_faces_ts
@@ -1295,7 +1299,7 @@ class InteractionManagerModule(yarp.RFModule):
             self._log("DEBUG", f"Responsive: no faces in landmarks (cache age={age:.1f}s, cached={cache_size})")
             return None
 
-        candidates: List[Tuple[int, str, float]] = []  # (track_id, name, area)
+        candidates: List[Tuple[int, str, float, bool]] = []  # (track_id, face_id, area, is_known)
 
         for face in faces:
             face_id = str(face.get("face_id", "")).strip()
@@ -1303,23 +1307,21 @@ class InteractionManagerModule(yarp.RFModule):
             bbox = face.get("bbox", [0, 0, 0, 0])
             area = bbox[2] * bbox[3] if isinstance(bbox, (list, tuple)) and len(bbox) >= 4 else 0
 
-            if not self._is_responsive_known_name(face_id):
-                self._log("DEBUG", f"Responsive: track={track_id} face_id='{face_id}' (not known)")
-                continue
-
             if not isinstance(track_id, int):
                 continue
 
-            candidates.append((track_id, face_id, area))
+            is_known = self._is_responsive_known_name(face_id)
+            candidates.append((track_id, face_id, area, is_known))
 
         if not candidates:
-            self._log("DEBUG", f"Responsive: no known faces from {len(faces)} total")
+            self._log("DEBUG", f"Responsive: no usable faces from {len(faces)} total")
             return None
 
-        # Pick biggest bbox among known faces
+        # Pick biggest bbox among visible faces
         best = max(candidates, key=lambda c: c[2])
-        self._log("DEBUG", f"Responsive: selected {best[1]} (track={best[0]}, area={best[2]:.0f})")
-        return (best[0], best[1])
+        known_label = "known" if best[3] else "unknown"
+        self._log("DEBUG", f"Responsive: selected {best[1]} ({known_label}, track={best[0]}, area={best[2]:.0f})")
+        return (best[0], best[1], best[3])
 
     def _is_greet_in_responsive_cooldown(self, name: str) -> bool:
         key = name.lower()
@@ -1436,6 +1438,60 @@ class InteractionManagerModule(yarp.RFModule):
             }))
         except Exception as e:
             self._log("WARNING", f"Responsive greeting failed: {e}")
+        finally:
+            self.run_lock.release()
+            self._responsive_active.clear()
+
+    def _run_responsive_unknown_intro(self, track_id: int, face_id: str):
+        if not self.run_lock.acquire(blocking=False):
+            self._log("DEBUG", f"Responsive unknown intro skipped for track={track_id} (busy)")
+            return
+        self._responsive_active.set()
+        try:
+            self._log("INFO", f"Responsive unknown greeting: track={track_id} face_id='{face_id}'")
+            t = threading.Thread(target=self._execute_behaviour, args=("ao_start",), daemon=True)
+            t.start()
+
+            self._responsive_speak_and_wait(self._im_prompts.get("ss1_greeting", "Hi there!"))
+
+            self.abort_event.clear()
+            self._clear_stt_buffer()
+            self._speak(self._im_prompts.get("ss1_ask_name", "We have not met, what's your name?"))
+
+            name_utterance = self._wait_user_utterance_abortable(self.SS2_STT_TIMEOUT)
+            if not name_utterance:
+                self._log("INFO", "Responsive unknown intro: no response to name question")
+                self._execute_behaviour("ao_stop")
+                return
+
+            name = self._try_extract_name(name_utterance)
+            if not name:
+                self._clear_stt_buffer()
+                self._speak(self._im_prompts.get("ss1_ask_name_retry", "Sorry, I didn't catch that. What's your name?"))
+                name_utterance2 = self._wait_user_utterance_abortable(self.SS2_STT_TIMEOUT)
+                if name_utterance2:
+                    name = self._try_extract_name(name_utterance2)
+
+            if not name:
+                self._log("INFO", "Responsive unknown intro: name extraction failed")
+                self._execute_behaviour("ao_stop")
+                return
+
+            self._log("INFO", f"Responsive unknown intro: extracted name '{name}' for track={track_id}")
+            threading.Thread(target=self._submit_face_name, args=(track_id, name), daemon=True).start()
+            self._write_last_greeted(track_id, face_id=name, code=name, person_key=name)
+            self._mark_greeted_today(name)
+            self._responsive_speak_and_wait(self._im_prompts.get("ss1_nice_to_meet", "Nice to meet you"))
+
+            self._execute_behaviour("ao_stop")
+            self._db_queue.put(("responsive", {
+                "type": "unknown_intro",
+                "track_id": track_id,
+                "name": name,
+                "payload": face_id,
+            }))
+        except Exception as e:
+            self._log("WARNING", f"Responsive unknown intro failed: {e}")
         finally:
             self.run_lock.release()
             self._responsive_active.clear()
