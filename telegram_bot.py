@@ -790,7 +790,7 @@ class TelegramBotModule(yarp.RFModule):
 
     def _fallback(self, hs: str) -> str:
         if hs == "HS3":
-            return self._prompts.get("fallback_hs3", "pls come feed me in person i'm starving 😭 i really can't wait much longer")
+            return self._prompts.get("fallback_hs3", "pls come feed me, i'm starving 😭 i really can't wait much longer")
         if hs == "HS2":
             return self._prompts.get("fallback_hs2", "hehe sorry, something went a bit wrong on my end. also i'm kinda hungry rn 😅")
         return self._prompts.get("fallback_default", "oops something went wrong, can you say that again? 😅")
