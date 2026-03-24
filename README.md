@@ -8,7 +8,7 @@
 
 1. [Big-Picture Overview](#1-big-picture-overview)
 2. [End-to-End System Flow](#2-end-to-end-system-flow)
-3. [Perception Layer (`perception.py`)](#3-perception-layer-perceptionpy)
+3. [Perception Layer (`vision.py`)](#3-perception-layer-visionpy)
 4. [Face Selection (`faceSelector.py`)](#4-face-selection-faceselectorpy)
    - [SS — Social States](#41-ss--social-states)
    - [LS — Learning States](#42-ls--learning-states)
@@ -34,20 +34,22 @@
 9. [Threading Architecture](#9-threading-architecture)
 10. [Key Constants](#10-key-constants)
 11. [YARP Connection Commands](#11-yarp-connection-commands)
+12. [Run Order](#12-run-order)
 
 ---
 
 ## 1. Big-Picture Overview
 
-iCub continuously watches the people in front of it through a camera. A perception pipeline detects faces, resolves their identity, and streams rich per-face observations — distance, gaze, bounding box, head pose — over YARP every frame. Three tightly coupled modules act on that stream:
+iCub continuously watches the people in front of it through a camera. A perception pipeline detects faces, resolves their identity, and streams rich per-face observations — distance, gaze, bounding box, head pose — over YARP every frame. Four tightly coupled modules act on that stream:
 
 | Module | Role |
 |---|---|
+| **`faceDetection`** | Detects/tracks faces and handles runtime face naming; publishes detections consumed by `vision.py` |
 | **`faceSelector`** | Interprets raw observations into social/learning states, picks one target, gates and fires interactions |
 | **`interactionManager`** | Executes conversation and behavior trees (greet → ask name → chat), calls Azure LLM, drives TTS/STT |
 | **`telegram_bot`** | Extends the relationship over Telegram; adapts personality to hunger level; persists a rich user profile that `interactionManager` reads back during face-to-face chats |
 
-All three modules share a small folder of JSON and SQLite files (`memory/`) that forms the robot's persistent social memory.
+The social-state modules (`faceSelector`, `interactionManager`, `telegram_bot`) share JSON and SQLite state that forms the robot's persistent social memory (by default under the deployed `alwaysOn` tree; `telegram_bot` uses this workspace `memory/` folder).
 
 ---
 
@@ -58,9 +60,10 @@ Camera frames
      │
      ▼
 ┌────────────────────────────────────────────────────────────────────┐
-│  perception.py  (VisionAnalyzer @ 20 Hz)                           │
+│  vision.py  (VisionAnalyzer @ 20 Hz)                               │
 │  · MediaPipe face mesh → head pose, gaze direction                 │
-│  · Object recognition → bounding box, track_id, face_id            │
+│  · Reads face detections from /alwayson/faceDetection/faces:o       │
+│  · Matches detections to landmarks → track_id, face_id, bbox        │
 │  · Derives: distance class · attention class · time_in_view        │
 │  · Publishes one YARP Bottle per face → /alwayson/vision/          │
 │    landmarks:o                                                     │
@@ -82,7 +85,7 @@ Camera frames
 │  · Executes SS1/SS2/SS3 conversation tree (or hunger-feed tree)    │
 │  · Monitors that the target stays visible throughout               │
 │  · Speaks (TTS), listens (STT), generates replies (Azure LLM)      │
-│  · Registers new faces with the object-recognition system          │
+│  · Registers new faces via /faceDetection RPC                      │
 │  · Returns compact JSON result → faceSelector                      │
 │  · Broadcasts hunger state (HS1/HS2/HS3) at 1 Hz                   │
 └────────────────────────────────────────────────────────────────────┘
@@ -105,12 +108,12 @@ faceSelector updates memory (greeted, talked, LS) + logs to SQLite
 
 ---
 
-## 3. Perception Layer (`perception.py`)
+## 3. Perception Layer (`vision.py`)
 
-`perception.py` is the **vision front-end**. It runs as a YARP `RFModule` at 20 Hz and wraps two sub-systems:
+`vision.py` is the **vision front-end**. It runs as a YARP `RFModule` at 20 Hz and wraps two sub-systems:
 
 - **MediaPipe Face Landmarker** — detects 478 face landmarks per frame and fits a 6-point 3-D face model to compute head-pose (pitch, yaw, roll) and gaze direction.
-- **Object Recognition** — tracks face identities across frames, assigning each face a stable `track_id` and eventually a resolved `face_id` (person name).
+- **Face Detection stream** (`/alwayson/faceDetection/faces:o`) — provides tracked face detections (`track_id`, `face_id`, bbox) that `vision.py` matches one-to-one with MediaPipe faces.
 
 **What gets published** per detected face on `/alwayson/vision/landmarks:o`:
 
@@ -120,9 +123,9 @@ faceSelector updates memory (greeted, talked, LS) + logs to SQLite
 | `face_id` | Resolved identity (`"Alice"`, `"unknown"`, `"recognizing"`) |
 | `bbox` | Bounding box `(x, y, w, h)` in pixels |
 | `distance` | `SO_CLOSE` / `CLOSE` / `FAR` / `VERY_FAR` (derived from normalised bbox height) |
-| `attention` | `MUTUAL_GAZE` / `NEAR_GAZE` / `SIDE_GAZE` / `UNKNOWN` (from head-pose yaw/pitch) |
+| `attention` | `MUTUAL_GAZE` / `NEAR_GAZE` / `AWAY` (from `cos_angle`), or `UNKNOWN` for unmatched detections |
 | `time_in_view` | Seconds the `track_id` has been continuously visible |
-| `talking` | Whether the person's lips are moving (mouth-motion std buffer) |
+| `is_talking` | Whether the person's lips are moving (mouth-motion std buffer) |
 | `head_pose` | Yaw, pitch, roll in degrees |
 
 **Distance thresholds** (normalised bbox height `h_norm = h / frame_height`):
@@ -134,7 +137,7 @@ faceSelector updates memory (greeted, talked, LS) + logs to SQLite
 | `FAR` | `0.10 < h_norm ≤ 0.20` |
 | `VERY_FAR` | `h_norm ≤ 0.10` |
 
-Faces detected by object recognition but not matched by MediaPipe (e.g., too far for landmarks) are still published with neutral pose values and `attention = "UNKNOWN"`, so `faceSelector` can still track their `time_in_view` and bbox size.
+Faces detected by `faceDetection` but not matched by MediaPipe (e.g., too far for landmarks) are still published with neutral pose values and `attention = "UNKNOWN"`, so `faceSelector` can still track their `time_in_view` and bbox size.
 
 ---
 
@@ -175,11 +178,11 @@ Known?    NO  ──────────────────────
 
 ### 4.2 LS — Learning States
 
-LS is **per-person** and persists in `memory/learning.json`. It controls how demanding the eligibility gate is — iCub is cautious with strangers and relaxes as it learns each person.
+LS is **per-person** and persists in `learning.json` (default path: `/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/learning.json`). It controls how demanding the eligibility gate is — iCub is cautious with strangers and relaxes as it learns each person.
 
 | LS | Label | Distance allowed | Attention required | Min `time_in_view` |
 |---|---|---|---|---|
-| `LS1` | Early / strict | `SO_CLOSE`, `CLOSE` only | `MUTUAL_GAZE` only | ≥ 3.0 s |
+| `LS1` | Early / strict | `SO_CLOSE`, `CLOSE` only | `MUTUAL_GAZE` only | ≥ 2.0 s |
 | `LS2` | Developing | `SO_CLOSE`, `CLOSE`, `FAR` | `MUTUAL_GAZE`, `NEAR_GAZE` | ≥ 1.0 s |
 | `LS3` | Advanced | Any | Any | ≥ 0.0 s |
 
@@ -259,7 +262,7 @@ reward < 0  →  LS = max(1, LS − 1)   regress
 reward = 0  →  no change
 ```
 
-Changes are logged to `data_collection/face_selector.db` and atomically persisted to `memory/learning.json`.
+Changes are logged to the default deployed `face_selector.db` and atomically persisted to the default deployed `learning.json` path.
 
 ---
 
@@ -283,13 +286,13 @@ Changes are logged to `data_collection/face_selector.db` and atomically persiste
 ```
 ① Say greeting via TTS (`ss1_greeting` prompt key, default: "Hi there!")
 ② Wait for any response (10 s)  →  no response: abort
-③ Say "We haven't met — what's your name?"
+③ Say "We have not met, what's your name?"
 ④ Wait for name response (10 s)  →  no response: abort
 ⑤ Extract name:
      fast regex  ("My name is X", "I'm X", "Call me X", …)
      → LLM fallback (GPT-5 nano, strict JSON schema, confidence clamped 0–1)
    Retry once on failure  →  still fails: abort name_extraction_failed
-⑥ Register name with /objectRecognition RPC
+⑥ Register name with /faceDetection RPC (`name <person_name> id <track_id>`)
 ⑦ Write memory/last_greeted.json
 ⑧ Say "Nice to meet you"
 
@@ -358,7 +361,7 @@ Loop:
   │    Still hungry  →  say "I'm still hungry. Give me more."
   │    HS1 reached  →  break (satisfied)
   └─ No QR within 8 s:
-       1st timeout  →  say "Take a look around, you'll find some food."
+      1st timeout  →  say "Take a look around, you will find some food."
        2nd consecutive timeout  →  abort: no_food_qr
 
 QR → hunger delta:
@@ -384,7 +387,7 @@ _target_monitor_loop  (15 Hz, staleness tolerance 5 s)
 These handle user-initiated events that arise while no proactive interaction is running. Events are **dropped immediately** (not queued) if an interaction is in progress.
 
 **Responsive Greeting**
-- Trigger: STT matches `"hello"`, `"hi"`, `"ciao"`, `"good morning"` (word-boundary regex)
+- Trigger: STT matches greeting words via regex (e.g. `"hello"`, `"hi"`, `"hey"`, `"ciao"`, `"buongiorno"`, `"good morning"`)
 - Candidate selection: pick the **biggest-bbox face among all visible faces**; the utterance itself is the attention signal — no gaze check needed
 - Cooldown: 10 s per candidate key (`<known_name>` for known users, `unknown:<track_id>` for unresolved users)
 - Action (known face): say `"Hi <name>"` + write `last_greeted`; wait 12 s for a follow-up; if received, enter a full SS3-style conversation loop (up to 3 turns, optional Telegram personalisation)
@@ -392,7 +395,7 @@ These handle user-initiated events that arise while no proactive interaction is 
 
 **Responsive QR Acknowledgment**
 - Trigger: QR scan detected outside of any active interaction
-- Action: say `"Yummy, thank you!"`
+- Action: say `"yummy, thank you"` (from `responsive_qr_ack_text` prompt key)
 
 ### 5.7 LLM Integration
 
@@ -421,7 +424,8 @@ wait = word_count / 3.0 + 0.5   clamped to [1.0, 8.0] seconds
 ```
 Abort event checked every 100 ms so the robot can be interrupted mid-sentence.
 
-**Required env vars:** `AZURE_OPENAI_ENDPOINT` · `AZURE_OPENAI_API_KEY` · `OPENAI_API_VERSION` · `AZURE_DEPLOYMENT_GPT5_NANO`
+**Required env vars:** `AZURE_OPENAI_ENDPOINT` · `AZURE_OPENAI_API_KEY` · `OPENAI_API_VERSION`  
+`AZURE_DEPLOYMENT_GPT5_NANO` is optional (fallback default is used if missing).
 
 ### 5.8 RPC Interface
 
@@ -555,7 +559,7 @@ Computed each cycle in `faceSelector` from memory files; executed in `interactio
 ### Learning State Machine (LS)
 
 ```
-[LS1] Strict               SO_CLOSE or CLOSE · MUTUAL_GAZE only · time_in_view ≥ 3 s
+[LS1] Strict               SO_CLOSE or CLOSE · MUTUAL_GAZE only · time_in_view ≥ 2 s
   │   reward +1 or +2
   ▼
 [LS2] Relaxed              + FAR allowed · + NEAR_GAZE allowed · time_in_view ≥ 1 s
@@ -567,7 +571,7 @@ Any level:  reward −1 or −2  →  regress one step  (floor: LS1)
 Any level:  reward +1 or +2  →  advance one step  (ceiling: LS3)
 ```
 
-Persisted per-person in `memory/learning.json`.
+Persisted per-person in the default deployed `learning.json` path.
 
 ### Hunger State Machine (HS)
 
@@ -582,7 +586,10 @@ Drains to 0 over 5 hours. HS string broadcast at 1 Hz to all connected subscribe
 
 ## 8. Shared Memory & Databases
 
-All persistent state lives in `memory/` and `data_collection/`.
+Persistent state is split across deployed default paths and workspace-local files:
+
+- `faceSelector` and `interactionManager` default to `/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/{memory,data_collection}`.
+- `telegram_bot` stores data under this workspace: `memory/telegram_bot.db`.
 
 ### JSON Memory Files
 
@@ -593,17 +600,17 @@ cross-process read-modify-write updates from `faceSelector` and
 
 | File | Owner | Content |
 |---|---|---|
-| `memory/learning.json` | `faceSelector` R+W | Per-person LS + `updated_at` |
-| `memory/greeted_today.json` | Both R+W | ISO timestamp of each person's last greeting today |
-| `memory/talked_today.json` | `faceSelector` R+W | ISO timestamp of each person's last conversation today |
-| `memory/last_greeted.json` | `interactionManager` writes · `faceSelector` reads | Latest greeting record per person |
+| `/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/learning.json` | `faceSelector` R+W | Per-person LS + `updated_at` |
+| `/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/greeted_today.json` | Both R+W | ISO timestamp of each person's last greeting today |
+| `/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/talked_today.json` | `faceSelector` R+W | ISO timestamp of each person's last conversation today |
+| `/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/last_greeted.json` | `interactionManager` writes · `faceSelector` reads | Latest greeting record per person |
 
 ### SQLite Databases
 
 | File | Owner | Tables |
 |---|---|---|
-| `data_collection/face_selector.db` | `faceSelector` | `target_selections` · `ss_changes` · `ls_changes` |
-| `data_collection/interaction_manager.db` | `interactionManager` | `interactions` · `responsive_interactions` |
+| `/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/data_collection/face_selector.db` | `faceSelector` | `target_selections` · `ss_changes` · `ls_changes` |
+| `/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/data_collection/interaction_manager.db` | `interactionManager` | `interactions` · `responsive_interactions` |
 | `memory/telegram_bot.db` | `telegram_bot` writes · `interactionManager` reads | `subscribers` · `chat_memory` · `user_memory` · `meta` |
 
 ### Prompts File
@@ -706,6 +713,10 @@ _tg_poll_loop (daemon)         →  long-polls Telegram getUpdates every 20 s
 
 ```bash
 # ── Perception → modules ─────────────────────────────────────────────
+yarp connect /icub/cam/left                    /alwayson/faceDetection/image:i
+yarp connect /icub/cam/left                    /alwayson/vision/img:i
+yarp connect /alwayson/faceDetection/faces:o   /alwayson/vision/recognition:i
+
 yarp connect /alwayson/vision/landmarks:o  /faceSelector/landmarks:i
 yarp connect /icub/camcalib/left/out       /faceSelector/img:i
 
@@ -728,3 +739,22 @@ echo "reload_prompts"      | yarp rpc /telegramBot/rpc
 ```
 
 > `faceSelector` auto-connects its own RPC ports to `interactionManager` at startup, and auto-wires `/faceSelector/context:i` ← `/alwayson/stm/context:o`. No manual wiring needed for those.
+
+---
+
+## 12. Run Order
+
+Recommended startup sequence (to avoid missing dependencies during warm-up):
+
+1. Start `yarpserver` and robot-side services (`/interactionInterface`, STT, TTS, camera publishers).
+2. Start `faceDetection.py` (publishes `/alwayson/faceDetection/faces:o` and serves RPC `/faceDetection` for face naming).
+3. Start `vision.py` (consumes face detections and publishes `/alwayson/vision/landmarks:o`).
+4. Start `interactionManager.py` (RPC + hunger broadcaster + responsive loop).
+5. Start `faceSelector.py` (consumes landmarks and triggers proactive interactions).
+6. Start `telegram_bot.py` (consumes hunger stream and handles Telegram chat).
+
+Quick rationale:
+- `vision.py` depends on `faceDetection` output (`/alwayson/vision/recognition:i`).
+- `faceSelector.py` and `interactionManager.py` both depend on `vision.py` landmarks output.
+- `faceSelector.py` proactively calls `interactionManager` RPC, so starting `interactionManager.py` first avoids initial skipped runs.
+- `telegram_bot.py` can start any time, but after `interactionManager.py` it immediately receives hunger updates.
