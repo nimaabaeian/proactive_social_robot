@@ -1765,12 +1765,12 @@ class InteractionManagerModule(yarp.RFModule):
     def _get_vision_rpc(self) -> yarp.RpcClient:
         if self._vision_rpc is None:
             client = yarp.RpcClient()
-            lp = f"/{self.module_name}/objectRecognition/rpc"
+            lp = f"/{self.module_name}/faceDetection/rpc"
             if not client.open(lp):
                 raise RuntimeError(f"Failed to open {lp}")
-            if not client.addOutput("/objectRecognition"):
+            if not client.addOutput("/faceDetection"):
                 client.close()
-                raise RuntimeError("Failed to connect to /objectRecognition")
+                raise RuntimeError("Failed to connect to /faceDetection")
             self._vision_rpc = client
         return self._vision_rpc
 
