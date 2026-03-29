@@ -1,22 +1,24 @@
 # Embodied Behaviour
 
-> **Robot:** iCub  
-> **Platform:** YARP  
+> **Robot:** iCub
+> **Platform:** YARP
 > **Author:** Nima Abaeian
 
-This document explains the runtime architecture in plain language and diagrams.
-It is intended to be the single technical reference for how the system senses, decides, interacts, and remembers.
+Architecture reference for the always-on proactive social robot system.
+Covers perception, selection, interaction, and relationship layers end-to-end.
 
 ---
 
-## 1) Big Picture (Intuition First)
+## 1) Big Picture
 
-Think of the system as four always-on layers:
+Four always-running layers, each with a distinct responsibility:
 
-1. **See people** (`vision.py`)
-2. **Choose who matters now** (`salienceNetwork.py`)
-3. **Run interaction behavior** (`executiveControl.py`)
-4. **Maintain long-term relationship over Telegram** (`chatBot.py`)
+| Layer | Module | Role |
+|---|---|---|
+| See | `vision.py` | Perceive faces, pose, gaze, talking, QR |
+| Choose | `salienceNetwork.py` | Decide who to look at and who to approach |
+| Act | `executiveControl.py` | Run interaction trees, manage hunger |
+| Remember | `chatBot.py` | Long-term relationship via Telegram |
 
 ### System map
 
@@ -24,29 +26,26 @@ Think of the system as four always-on layers:
            CAMERA
              |
              v
- +---------------------------+
- | vision.py                 |
- | detect / track / identify |
- | gaze / pose / talking /QR |
- +---------------------------+
-             |
-             | /alwayson/vision/landmarks:o
+ +------------------------------+
+ | vision.py                    |
+ | YOLO + ByteTrack + MediaPipe |
+ | gaze / pose / talking / QR  |
+ +------------------------------+
+             |  /alwayson/vision/landmarks:o
              v
  +------------------------------+
  | salienceNetwork.py           |
- | social state + adaptive IPS  |
- | target arbitration + gating  |
+ | IPS scoring + SS assignment  |
+ | two-layer arbitration        |
  +------------------------------+
-             |
-             | RPC run(track, face, ss)
+             |  RPC run(track_id, face_id, ss)
              v
  +------------------------------+
  | executiveControl.py          |
  | SS trees + hunger tree       |
- | TTS/STT + responsive behavior|
+ | TTS / STT / QR feed / LLM   |
  +------------------------------+
-             |
-             | /alwayson/executiveControl/hunger:o
+             |  /alwayson/executiveControl/hunger:o
              v
  +------------------------------+
  | chatBot.py                   |
@@ -57,30 +56,50 @@ Think of the system as four always-on layers:
 
 Supporting utilities:
 
-- `generateQr.py`: creates feed QR codes (`SMALL_MEAL`, `MEDIUM_MEAL`, `LARGE_MEAL`)
-- `mockPublisher.py`: publishes mock STM context and mock hunger transitions
+- `generateQr.py` — generates `SMALL_MEAL`, `MEDIUM_MEAL`, `LARGE_MEAL` QR PNGs
+- `mockPublisher.py` — synthetic STM context and hunger stream for integration testing
 
 ---
 
-## 2) Dataflow and Controlflow
-
-### End-to-end runtime sequence
+## 2) End-to-End Dataflow
 
 ```text
 [Frame arrives]
-   -> vision.py publishes per-face landmarks
-   -> salienceNetwork.py computes SS + IPS, selects target
-   -> salienceNetwork.py checks cooldown/eligibility/executive availability
-   -> executiveControl.py executes tree (social or hunger)
-   -> executiveControl.py updates JSON/DB and publishes hunger
-   -> chatBot.py adapts Telegram behavior from hunger stream
+  -> vision.py drains backlog, keeps freshest frame
+  -> YOLO detects faces, ByteTrack assigns stable track_id
+  -> MediaPipe computes head pose, gaze direction
+  -> lip motion analysis decides is_talking
+  -> face_recognition matches known identities (with sticky retry)
+  -> QR detector (throttled, once per 10 frames) emits new codes
+  -> landmarks bottle published per face
+
+[salienceNetwork loop @ 20 Hz]
+  -> reads landmark stream
+  -> computes IPS score per face
+  -> assigns social state (ss1..ss4) from memory files
+  -> selects attention target (gaze) continuously
+  -> when gates pass: spawns interaction thread → RPC run()
+
+[executiveControl on run()]
+  -> starts target monitor thread (abort if face gone > 12s)
+  -> chooses behavior path: hunger tree or social SS tree
+  -> TTS/STT exchanges, async LLM for responses
+  -> writes greeted/talked flags, logs to SQLite
+  -> publishes hunger state continuously
+
+[chatBot main loop @ 10 Hz]
+  -> reads hunger port
+  -> drains Telegram update queue (up to 25/cycle)
+  -> generates hunger-aware LLM replies
+  -> extracts user profile from message text
+  -> broadcasts HS3 starvation alerts to subscribers
 ```
 
 ### Fast mental model
 
 ```text
-Perception stream (high rate) ---> Selection gate ---> Interaction transaction ---> Memory update
-         continuous                    opportunistic           bounded/abortable        asynchronous
+Perception (high rate) → Selection gate → Interaction transaction → Memory update
+    continuous              opportunistic        bounded/abortable       persistent
 ```
 
 ---
@@ -91,61 +110,60 @@ Perception stream (high rate) ---> Selection gate ---> Interaction transaction -
 
 ### What it does
 
-- Reads image stream and runs:
-  - YOLO face detection
-  - ByteTrack identity continuity (`track_id`)
-  - optional `face_recognition` matching
-  - MediaPipe Face Landmarker (pose/gaze)
-  - QR decoding
-- Publishes one rich landmark bottle per face.
-- Publishes scene-level compact features.
-- Receives selected target (`track_id`, `ips`) and sends FaceTracker-compatible bbox command.
-- Drains camera-input backlog and processes the freshest frame to reduce display lag/stutter.
-- Supports runtime naming over RPC: `name <person_name> id <track_id>`.
+Reads the camera stream and produces per-face rich descriptors that downstream modules consume.
 
-### Per-face output model
+- **YOLO face detection** — detects faces with confidence threshold, expands bounding boxes by 10% for better face crops
+- **ByteTrack** — maintains stable `track_id` across frames, even through brief occlusions
+- **face_recognition matching** — compares embeddings against a `faces/` image database; uses min+median distance for robustness; unknown faces are retried up to 3 times with configurable interval; identity is kept sticky for 1.5 s after a tracker drop
+- **MediaPipe Face Landmarker** — computes 3D head pose (pitch/yaw/roll), gaze direction vector, and cosine angle to camera for up to 10 faces
+- **Talking detection** — tracks normalized mouth-open values in a 10-frame sliding window; face is flagged `is_talking` if the standard deviation exceeds a threshold
+- **QR detection** — throttled to 1 in 10 frames; emits each new QR value exactly once per appearance (hysteresis window suppresses repeat triggers)
+- **Target delegation** — receives a lightweight `[track_id, ips_score]` command from `salienceNetwork`, finds the matching bounding box, and forwards a FaceTracker-compatible full bbox bottle
+- **Backlog draining** — reads the camera port until no new frames are queued, then processes only the freshest frame to minimize display lag
+- **Runtime naming** — `name <person_name> id <track_id>` RPC command enrolls the visible face into the identity database on the fly
+
+### Per-face landmark output
 
 ```text
 face_id, track_id,
 bbox(x,y,w,h), zone, distance,
-gaze_direction, pitch/yaw/roll, cos_angle,
+gaze_direction(x,y,z), pitch, yaw, roll, cos_angle,
 attention, is_talking, time_in_view
 ```
 
-### Internal perception pipeline
+### Perception pipeline
 
 ```text
-RGB frame
-   |
-   +--> YOLO --> face boxes -------------------+
-   |                                           |
-   +--> ByteTrack --> stable track_id ---------+--> fused face objects
-   |                                           |
-   +--> MediaPipe landmarks --> head pose/gaze-+
-   |
-   +--> lip landmarks buffer --> is_talking
-   |
-   +--> QR detector --> /alwayson/vision/qr:o
+RGB frame (freshest, backlog drained)
+  |
+  +--> YOLO face detector (conf > 0.7, bbox +10%)
+  |       |
+  |       +--> ByteTrack → stable track_id
+  |       |
+  |       +--> face_recognition → face_id
+  |              (sticky 1.5s, retry up to 3x)
+  |
+  +--> MediaPipe Face Landmarker → pose / gaze
+  |
+  +--> Lip motion std-dev → is_talking flag
+  |
+  +--> QR detector (1/10 frames) → /alwayson/vision/qr:o
+  |
+  +--> fused per-face landmark bottle → /alwayson/vision/landmarks:o
 ```
 
 ### Ports and RPC
 
-- Input:
-  - `/alwayson/vision/img:i`
-  - `/alwayson/vision/targetCmd:i`
-- Outputs:
-  - `/alwayson/vision/landmarks:o`
-  - `/alwayson/vision/features:o`
-  - `/alwayson/vision/targetBox:o`
-  - `/alwayson/vision/faces_view:o`
-  - `/alwayson/vision/qr:o`
-- RPC:
-  - `/alwayson/vision/rpc` (`name`, `help`, `process`, `quit`)
-
-RPC endpoint note:
-
-- The RPC port name is configurable via `rpc_name` in `vision.py` ResourceFinder params.
-- Default effective endpoint is `/alwayson/vision/rpc`.
+| Direction | Port | Content |
+|---|---|---|
+| Input | `/alwayson/vision/img:i` | Raw RGB camera stream |
+| Input | `/alwayson/vision/targetCmd:i` | `[track_id, ips]` from salienceNetwork |
+| Output | `/alwayson/vision/landmarks:o` | Per-face landmark bottles |
+| Output | `/alwayson/vision/features:o` | Scene-level compact features |
+| Output | `/alwayson/vision/targetBox:o` | FaceTracker-compatible bbox bottle |
+| Output | `/alwayson/vision/faces_view:o` | Annotated debug image |
+| Output | `/alwayson/vision/qr:o` | Detected QR payload strings |
+| RPC | `/alwayson/vision/rpc` | `name`, `help`, `process`, `quit` |
 
 ---
 
@@ -153,180 +171,145 @@ RPC endpoint note:
 
 ### What it does
 
-- Consumes face landmarks from `vision.py`.
-- Computes social state `ss1..ss4` per face.
-- Computes adaptive IPS (interest priority score).
-- Decides:
-  - who the robot should **look at**
-  - who the robot should **talk to**
-- Triggers `executiveControl` only when a candidate passes gates.
-- Logs events and updates social-learning memory.
+Consumes the face landmark stream and decides two things every loop cycle:
+
+1. **Who to look at** (attention target — continuous)
+2. **Who to approach** (dialogue trigger — opportunistic, gated)
+
+It also updates per-person adaptive weights after each interaction outcome.
 
 ### Two-layer arbitration
 
 ```text
-LAYER A: ATTENTION (head/eyes target)
-  priority:
-    1) executive override track_id
-    2) active interaction track lock
-    3) best IPS face
+LAYER A — ATTENTION (head/eye gaze target)
+  Priority order:
+    1) RPC override track_id (set_track_id command)
+    2) Active interaction lock (holds gaze on current partner)
+    3) Highest IPS face
 
-LAYER B: DIALOGUE (start proactive interaction)
-  requires:
-    - not interaction_busy
-    - no override active
-    - candidate eligible
-    - cooldown passed
-    - executiveControl status = not busy
+LAYER B — DIALOGUE (start proactive interaction)
+  All of these must pass:
+    - interaction_busy == false
+    - no RPC override active
+    - candidate social state eligible (IPS >= SS threshold)
+    - cooldown passed for this face
+    - executiveControl status != busy
 ```
 
-### IPS intuition
+### IPS score (Interest Priority Score)
+
+The IPS ranks how interesting each face is right now.
+
+**Step 1 — Normalize input signals**
 
 ```text
-IPS = weighted_sum(proximity, centricity, approach_velocity, gaze)
-  * optional_habituation_decay(time_idle)
-      + hysteresis_bonus(if same target)
+s_prox = clamp(bbox_height / image_height, 0, 1)     # closeness
+
+cx, cy = bbox center
+s_cent = clamp(1 - dist_to_image_center / max_dist, 0, 1)  # centrality
+
+s_vel  = clamp((area_now - area_prev) / (W*H) * 10, 0, 1)  # approach speed
+
+s_gaze = max(0, cos_angle)                           # looking toward camera
 ```
 
-### IPS algorithm (implemented)
-
-The score used in `salienceNetwork.py` is computed per face as follows.
-
-1) **Normalize input variables**
+**Step 2 — Weighted sum (per-person or baseline)**
 
 ```text
-Given bbox = (x, y, w, h), image size = (W=640, H=480)
-
-s_prox = clamp(h / H, 0, 1)
-
-cx = x + w/2
-cy = y + h/2
-max_dist = sqrt((W/2)^2 + (H/2)^2)
-dist_center = sqrt((cx - W/2)^2 + (cy - H/2)^2)
-s_cent = clamp(1 - dist_center/max_dist, 0, 1)
-
-area_now  = w*h
-area_prev = previous area for same track_id (or area_now if first sight)
-raw_vel   = (area_now - area_prev) / (W*H)
-s_vel     = clamp(raw_vel * 10.0, 0, 1)
-
-s_gaze = clamp(cos_angle, 0, 1)
-```
-
-2) **Apply person-specific weights**
-
-If the person exists in `learning.json`, use learned weights; otherwise use baseline:
-
-```text
-w_prox=0.5, w_cent=0.15, w_vel=0.3, w_gaze=0.5
+baseline:  w_prox=0.5, w_cent=0.15, w_vel=0.3, w_gaze=0.5
 
 base_ips = w_prox*s_prox + w_cent*s_cent + w_vel*s_vel + w_gaze*s_gaze
 ```
 
-3) **Apply habituation decay (conditional)**
+If a person has been interacted with before, their learned weights replace the baseline.
+
+**Step 3 — Hysteresis bonus**
 
 ```text
-Habituation is applied only to the current tracked face, and only when:
-  - interaction_busy == false
-  - more than one face is visible
-  - at least one competing face currently has higher IPS
-
-time_since_last_interaction = now - last_interaction_time(cooldown_key)
-t_idle = min(time_in_view, time_since_last_interaction)
-habituation = exp(-lambda * t_idle), lambda = 0.05
-
-ips_current_target = base_ips_current_target * habituation
+if face.track_id == current_target:
+    ips += 0.3    # stabilizes current target, prevents noisy switching
 ```
 
-4) **Apply hysteresis bonus**
+**Step 4 — Habituation decay (conditional)**
+
+Applied only to the current tracked face and only when all three are true:
+- interaction is not running
+- more than one face is visible
+- at least one competing face currently has higher IPS
 
 ```text
-if face.track_id == current_target_track_id and track_id != -1:
-    ips += 0.3
+t_idle      = min(time_in_view, time_since_last_interaction)
+habituation = exp(-0.05 * t_idle)
+ips_current = ips_current * habituation
 ```
 
-5) **Use IPS for behavior decisions**
+This gradually releases gaze lock toward a more novel face.
+
+**Step 5 — Eligibility thresholds by social state**
 
 ```text
-Target selection: max IPS face
-
-Eligibility thresholds by social state:
-  ss1 >= 1.0
-  ss2 >= 0.8
-  ss3 >= 1.2
-  ss4 >= 99.0  (effectively never proactive)
-
-Tracking gate (look-only): target IPS must also pass min_track_ips (default 0.9)
-
-Tracking stop behavior includes hysteresis + debounce:
-  start/switch threshold = min_track_ips (default 0.9)
-  stop threshold         = min_track_ips - track_stop_hysteresis (default 0.8)
-  stop debounce          = track_stop_debounce_sec (default 2.0s)
-
-Target command stream is event-driven with keepalive resend:
-  keepalive period = target_cmd_keepalive_sec (default 0.5s)
+ss1 (unknown)            IPS >= 1.0
+ss2 (known, ungreeted)   IPS >= 0.8   (more eager to approach)
+ss3 (greeted, no talk)   IPS >= 1.2   (more conservative)
+ss4 (fully talked)       IPS >= 99.0  (never proactively triggered)
 ```
 
-### How it is adaptive
-
-`salienceNetwork.py` adapts online in two ways:
-
-1. **Short-term adaptation (within session)**
-  - Habituation decay is applied only in competitive multi-face moments (reduces lock-in to the current target).
-  - Hysteresis bonus stabilizes the current target and prevents noisy switching.
-
-2. **Long-term adaptation (across sessions)**
-  - Per-person IPS weights are updated after each interaction outcome.
-  - Success shifts behavior toward proactive selection.
-  - Failure shifts behavior toward conservative/reactive selection.
+**Tracking gate (look-only)**
 
 ```text
-interaction result
-  |
-  +--> success? yes --> increase prox/vel, decrease gaze
-  |
-  +--> success? no  --> decrease prox/vel, increase gaze
-  |
-  +--> save weights in learning.json
-  |
-  +--> future IPS uses updated personal weights
+start/switch threshold     = min_track_ips (default 0.9)
+stop threshold             = min_track_ips - hysteresis (default 0.8)
+stop debounce              = 2.0 s
+keepalive resend           = every 0.5 s
 ```
 
-### Social-state assignment
+### Adaptive learning
+
+After each interaction the weights of the involved person shift:
 
 ```text
-is_known = false                     -> ss1
-is_known = true, greeted_today = no  -> ss2
-is_known = true, greeted=yes, talked=no -> ss3
-is_known = true, greeted=yes, talked=yes -> ss4
+success → increase prox/vel weights, decrease gaze weight
+          (reward proximity and approach behavior)
+
+failure → decrease prox/vel weights, increase gaze weight
+          (require stronger gaze signal before re-approaching)
+
+shift rate = ±0.15 per interaction
+saved to learning.json
+```
+
+### Social state assignment
+
+Social state determines which interaction tree runs and sets the IPS threshold.
+
+```text
+face_id == "unknown"                              → ss1
+face_id known, not in greeted_today.json          → ss2
+face_id known, greeted today, not in talked_today → ss3
+face_id known, greeted and talked today           → ss4
 ```
 
 ### Context-aware cooldown
 
+An optional STM context stream adjusts how long before re-approaching the same face:
+
 ```text
-STM label = 1  -> lively  -> short cooldown
-STM label = 0  -> calm    -> long cooldown
-STM missing    -> default cooldown
+STM label = 1  (lively)   → short cooldown (3 s)
+STM label = 0  (calm)     → long cooldown (15 s)
+STM missing               → default cooldown (5 s)
 ```
 
 ### Ports and RPC
 
-- Input:
-  - `/alwayson/salienceNetwork/landmarks:i`
-  - `/alwayson/salienceNetwork/context:i` (optional)
-- Outputs:
-  - `/alwayson/salienceNetwork/targetCmd:o`
-  - `/alwayson/salienceNetwork/debug:o`
-- RPC server:
-  - `/salienceNetwork` (`set_track_id`, `reset_cooldown`)
-- RPC clients:
-  - `/salienceNetwork/executiveControl:rpc`
-  - `/salienceNetwork/faceTracker:rpc`
-
-FaceTracker lifecycle note:
-
-- `salienceNetwork.py` sends `run` to FaceTracker during startup.
-- `salienceNetwork.py` sends `sus` to FaceTracker during module close.
+| Direction | Port | Content |
+|---|---|---|
+| Input | `/alwayson/salienceNetwork/landmarks:i` | Face landmark bottles from vision |
+| Input | `/alwayson/salienceNetwork/context:i` | Optional STM context label |
+| Output | `/alwayson/salienceNetwork/targetCmd:o` | `[track_id, ips]` to vision |
+| Output | `/alwayson/salienceNetwork/debug:o` | Debug state bottle |
+| RPC server | `/salienceNetwork` | `set_track_id`, `reset_cooldown` |
+| RPC client | `/salienceNetwork/executiveControl:rpc` | `status`, `run` |
+| RPC client | `/salienceNetwork/faceTracker:rpc` | `run` on startup, `sus` on close |
 
 ---
 
@@ -334,92 +317,166 @@ FaceTracker lifecycle note:
 
 ### What it does
 
-- Receives proactive run requests (`run track_id face_id ss`).
-- Runs social interaction trees (`ss1`, `ss2`, `ss3`, `ss4`).
-- Runs hunger feeding tree when hunger policy requires it.
-- Publishes hunger state continuously.
-- Handles responsive interactions when no proactive interaction is running.
-- Uses Azure OpenAI for name extraction + short conversational turns.
+- Executes social interaction trees for each social state (ss1–ss4)
+- Runs a hunger feeding tree when the robot is hungry
+- Handles responsive interactions (greeting detection from STT, opportunistic QR feeds)
+- Manages the `HungerModel` — a time-draining stomach level that persists across restarts
+- Publishes current hunger state to `chatBot`
+- Performs cross-channel personalization: looks up the face's name in the Telegram DB to personalize face-to-face conversation with learned preferences (likes, dislikes, topics, inside jokes)
+- Uses Azure OpenAI for name extraction and short conversational turns
 
-### Proactive interaction flow
+### Behavior routing
 
 ```text
-run(track, face, ss)
-   |
-   +--> start target monitor (abort if target lost too long)
-   |
-   +--> choose behavior path:
-         - hunger path (HS3 always, HS2+ss3)
-         - social tree path (ss1/ss2/ss3/ss4)
-   |
-   +--> return compact result JSON
+run(track_id, face_id, ss)
+  |
+  +--> ss4?  → no-op success, return immediately
+  |
+  +--> resolve face_id (wait up to 5 s if still "recognizing")
+  |
+  +--> start target monitor (abort if face absent > 12 s)
+  |
+  +--> check hunger state:
+        HS3 (starving)          → hunger tree always
+        HS2 (hungry) + ss3      → hunger tree
+        otherwise               → social SS tree
+  |
+  +--> return compact result JSON to salienceNetwork
 ```
 
-### Social trees (intuitive)
+### Social interaction trees
 
+**SS1 — Unknown person**
 ```text
-SS1 unknown:
-  greet -> wait -> ask name -> (retry if needed) -> extract name -> register -> close
+1. Greet
+2. Wait for response  →  no response  →  abort
+3. Ask name           →  no response  →  abort
+4. Extract name via LLM (retry once)  →  fail  →  abort
+5. Register face identity via vision RPC
+6. Update last_greeted.json + greeted_today.json
+7. "Nice to meet you" → success, advance to ss3 path
+```
 
-SS2 known/not greeted:
-  greet attempt #1 -> if response go SS3
-  else greet attempt #2 -> if response go SS3 else abort
+**SS2 — Known, not greeted today**
+```text
+1. "Hi <name>"
+2. Wait for response  →  responded  →  enter SS3 tree
+3. No response        →  "Hi <name>" again (attempt 2)
+4. Responded          →  enter SS3 tree
+   No response        →  abort
+```
 
-SS3 known/greeted/not talked:
-  starter -> up to max turns follow-up/closing
-  if user speaks at least once => talked=true => ss4 path
+**SS3 — Known, greeted, not talked today**
+```text
+1. Look up face name in Telegram DB for personalized context
+   (likes, dislikes, topics, inside jokes, age)
+2. Generate conversation starter via async LLM
+   (background-generated in advance; bounded local wait with fallback)
+3. Speak starter
+4. Up to 3 turns:
+     wait STT utterance (12 s timeout)
+     → submit follow-up or closing LLM request (async, fallback)
+     → speak reply
+5. If user responded at least once → talked=True, success, advance to ss4
+   Otherwise                       → abort no_response_conversation
+```
 
-SS4:
-  no-op success
+**SS4 — Already fully interacted today**
+```text
+No-op. Returns success immediately.
 ```
 
 ### Hunger subsystem
 
+`HungerModel` maintains a continuous stomach level (0–100%) that drains over time.
+
 ```text
-stomach level drains over time (HungerModel)
+Drain rate:  100% over 5 hours (~0.0055%/s)
+Persists:    hunger_state.json (survives restarts)
 
-HS1: normal
-HS2: hungry
-HS3: starving
-
-if hunger tree active:
-  ask for food -> wait QR -> apply delta -> thank -> repeat until satisfied or timeout
+HS1: level >= 60%  (normal)
+HS2: level >= 25%  (hungry)
+HS3: level <  25%  (starving)
 ```
 
-Feed deltas:
+**Hunger feeding tree**
 
-- `SMALL_MEAL` = +10
-- `MEDIUM_MEAL` = +25
-- `LARGE_MEAL` = +45
+```text
+1. Ask for food ("I'm hungry, would you feed me?")
+2. Wait for a QR scan (up to feed_wait_timeout_sec)
+3. QR received  → apply meal delta, "Yummy, thank you"
+                → if still hungry → ask for more
+                → if HS1 reached  → done
+4. No QR        → "Look around for food" (prompt #1)
+5. Second miss  → abort (no_food_qr)
+```
+
+Feed deltas from QR codes:
+
+| QR payload | Stomach delta |
+|---|---|
+| `SMALL_MEAL` | +10% |
+| `MEDIUM_MEAL` | +25% |
+| `LARGE_MEAL` | +45% |
+
+QR detection is throttled to avoid duplicate feeds (3 s cooldown per scan).
 
 ### Responsive interactions
 
+A separate thread monitors STT and QR events outside of proactive interactions.
+
 ```text
-responsive loop:
-  - if proactive busy: drop responsive events immediately
-  - greeting detected in STT -> choose largest face -> greet/intro path
-  - QR feed outside proactive -> short acknowledgment
+Event arrives
+  |
+  +--> proactive running?  yes → drop immediately (never deferred)
+  |
+  +--> event type:
+        greeting in STT ("hello", "hi", "hey", "ciao", "buongiorno")
+          + MUTUAL_GAZE or NEAR_GAZE attention required
+          + 10 s per-face cooldown
+          → greet/intro response to largest visible face
+
+        QR feed outside proactive
+          → short acknowledgment
 ```
 
 ### LLM execution model
 
+All LLM calls are submitted asynchronously to avoid blocking the interaction thread.
+
 ```text
-main thread submits request --> async worker --> result map
-                                   |
-                                   +--> timeout/cancel fallback if overdue
+interaction thread
+  -> submit_llm_request(kind, utterance, user_context)
+  -> bounded local wait (1.0 s)
+  -> if result ready: use it
+     if not: use fallback string (never stall TTS)
+
+background:
+  -> async LLM worker drains request queue
+  -> stores result in result map
+  -> cancelled requests discarded
 ```
+
+A conversation starter for SS3 is pre-generated in the background before it is needed.
 
 ### Ports and RPC
 
-- RPC server: `/executiveControl`
-  - `status`, `ping`, `help`, `run`, `hunger`, `quit`
-- Inputs:
-  - `/alwayson/executiveControl/landmarks:i`
-  - `/alwayson/executiveControl/stt:i`
-  - `/alwayson/executiveControl/qr:i`
-- Outputs:
-  - `/alwayson/executiveControl/speech:o`
-  - `/alwayson/executiveControl/hunger:o`
+| Direction | Port | Content |
+|---|---|---|
+| Input | `/alwayson/executiveControl/landmarks:i` | Face landmarks (target monitor) |
+| Input | `/alwayson/executiveControl/stt:i` | Speech-to-text transcripts |
+| Input | `/alwayson/executiveControl/qr:i` | QR payload strings from vision |
+| Output | `/alwayson/executiveControl/speech:o` | TTS text to speech synthesizer |
+| Output | `/alwayson/executiveControl/hunger:o` | Current hunger state string |
+| RPC server | `/executiveControl` | `status`, `ping`, `run`, `hunger`, `help`, `quit` |
+
+**RPC `hunger` command level mapping:**
+
+```text
+hs1 → set level to 100%
+hs2 → set level to  59%
+hs3 → set level to  24%
+```
 
 ---
 
@@ -427,348 +484,364 @@ main thread submits request --> async worker --> result map
 
 ### What it does
 
-- Polls Telegram updates in background.
-- Consumes hunger state from executive.
-- Generates hunger-aware replies using prompt overlays.
-- Stores:
-  - per-chat memory summary/history
-  - per-user profile memory
-- Broadcasts starvation messages in HS3 using cooldown rules.
+Maintains a persistent social relationship with each user over Telegram, independent of physical proximity. The robot's hunger state shapes how it communicates.
 
-### Behavior by hunger state
+- Long-poll Telegram updates in a background thread
+- Generates responses with Azure OpenAI, using per-user memory and chat history
+- Injects time context (time of day, gap since last message) into every reply
+- Extracts user profile from message text via regex (no extra LLM call needed)
+- Periodically summarizes conversation history to keep context compact
+- Broadcasts starvation alerts (HS3) to all Telegram subscribers
+
+### Hunger-driven persona
 
 ```text
-HS1: normal social texting
-HS2: normal + occasional hunger leakage
-HS3: strict starving mode, in-person feeding request focus
+HS1 (normal)   → standard friendly social texting
+HS2 (hungry)   → normal + hunger leakage every 3 messages without a mention
+HS3 (starving) → strict override: acknowledge everything else in ≤3 words,
+                  then beg the person to come feed the robot in person
+                  (panicked, emotional, guilt-trippy, short)
 ```
 
 ### HS3 broadcast logic
 
 ```text
-on HS3 entry:
-  broadcast to all subscribers
+HS3 entered → immediately broadcast to ALL subscribers
 
-while staying HS3:
-  periodic rebroadcast candidates by cooldown
-  skip users who chatted very recently
+While remaining HS3:
+  → periodic re-broadcast per subscriber (cooldown: 30 min each)
+  → skip users who chatted within the last 10 min (don't spam active users)
+
+Broadcast message is LLM-generated; falls back to prompt template on failure.
 ```
 
-### User memory extraction model
+### Conversation memory model
 
-From message metadata and text patterns, stores compact user profile:
+Each chat has two layers of memory:
 
-- name / nickname / age
-- likes / dislikes / topics
-- recent life update
-- conversation style
-- inside jokes (with confidence through repetition)
+```text
+rolling history  → last 10 turns stored verbatim (with timestamps)
+summary          → regenerated every 8 turns via LLM
+                   anchored to known facts (name, likes) so they survive compression
+```
+
+Both are stored in `chat_bot.db` and survive restarts.
+
+### User profile extraction
+
+User facts are extracted passively from message text using regex patterns. No extra LLM call.
+
+| Field | Example triggers |
+|---|---|
+| `name` | "my name is X", "call me X", "I'm called X", "they call me X" |
+| `nickname` | "just call me X", "my nickname is X", "everyone calls me X" |
+| `age` | "I'm 23", "I just turned 25", "turning 30 soon" |
+| `likes` | "I love X", "I'm a fan of X", "my favourite is X" |
+| `dislikes` | "I hate X", "can't stand X", "not a fan of X" |
+| `favorite_topics` | "I'm really into X", "I love talking about X" |
+| `last_personal_update` | "I just moved to X", "I started a new job" |
+| `conversation_style` | emoji usage, message length, tone |
+
+**Inside jokes** are tracked with a count and timestamp. A joke must be referenced at least 2 times before it is considered confirmed and used in conversation context.
+
+Additionally, Telegram metadata (sender name from `from.first_name`) is used to pre-populate `name` before any text extraction.
 
 ### RPC
 
-- `/chatBot/rpc`
-  - `status`
-  - `set_hs HS1|HS2|HS3`
-  - `reload_prompts`
+| Command | Effect |
+|---|---|
+| `status` | Returns hunger state, subscriber count, queue size, thread health |
+| `set_hs HS1\|HS2\|HS3` | Manual override of effective hunger state (bypasses stale protection) |
+| `reload_prompts` | Hot-reload `prompts.json` without restart |
 
-Prompt path behavior:
-
-- Default prompt file path resolves to parent `alwaysOn` directory: `../prompts.json`.
-- Runtime override is supported through ResourceFinder `prompts` parameter.
+**Stale hunger protection:** if no hunger update arrives for 60 s and no manual override is active, effective state falls back to HS1 to avoid stuck HS2/HS3 behavior.
 
 ---
 
 ## 3.5 `mockPublisher.py` — Test Stream Generator
 
-Publishes synthetic channels for integration testing without full upstream stack:
+Publishes synthetic channels for integration testing without the full upstream stack:
 
-- `/alwayson/stm/context:o` → `(episode_id, chunk, label)`
-- `/interactionManager/hunger:o` → hunger transitions over `{HS1, HS2, HS3}`
-  - compatibility-only mock stream using historical naming
-  - main live architecture stream is `/alwayson/executiveControl/hunger:o`
+- `/alwayson/stm/context:o` → `(episode_id, chunk, label)` — STM context labels
+- `/interactionManager/hunger:o` → hunger state transitions over `{HS1, HS2, HS3}`
+  (compatibility stream using historical naming; live architecture uses `/alwayson/executiveControl/hunger:o`)
 
 ---
 
 ## 3.6 `generateQr.py` — Feed QR Generator
 
-Generates QR PNGs used by hunger feed path:
+Generates QR PNGs for the hunger feeding path:
 
-- `small_meal.png`
-- `medium_meal.png`
-- `large_meal.png`
+- `small_meal.png` → `SMALL_MEAL`
+- `medium_meal.png` → `MEDIUM_MEAL`
+- `large_meal.png` → `LARGE_MEAL`
 
-Optional decode validation with `--verify`.
+Run with `--verify` to decode and validate generated QR codes.
 
 ---
 
 ## 3.7 `prompts.json` — Prompt Surface
 
-Contains prompt sets for:
+Central prompt file loaded by both `executiveControl` and `chatBot` at startup and hot-reloadable.
 
-- `chat_bot`
-- `executiveControl`
+**`executiveControl` section:**
+- `system_default`, `system_json` — base LLM system prompts
+- `ss1_greeting`, `ss1_ask_name`, `ss1_ask_name_retry`, `ss1_nice_to_meet`
+- `ss2_greeting`
+- `convo_starter_fallback`, `ss3_mid_turn_fallback`, `closing_ack_fallback`
+- `hunger_ask_feed`, `hunger_thank_feed`, `hunger_still_hungry`, `hunger_look_around`
 
-Includes system prompts, extraction prompts, starter/follow-up/closing templates, hunger overlays, and fallbacks.
+**`chat_bot` section:**
+- `base_system_prompt`
+- `hs_overlays.HS1`, `hs_overlays.HS2`, `hs_overlays.HS3` — layered on top of base
+- `hs3_override_system` — strict starvation override injected at the top of the message list
+- `hs2_force_hunger_system` — forced hunger comment directive
+- `hs3_broadcast_system`, `hs3_broadcast_user` — LLM prompts for HS3 broadcasts
+- `hs3_broadcast_fallback` — hard-coded fallback if LLM fails
+- `summarize_system` — prompt for periodic history summarization
+- `summary_injection` — template to inject summary back into context
+- `start_greeting`, `start_greeting_with_name`, `reset_reply`
+- `fallback_default`, `fallback_hs2`, `fallback_hs3`
 
 ---
 
 ## 4) State Machines
 
-## 4.1 Social state (`salienceNetwork.py`)
+### 4.1 Social state (assigned in `salienceNetwork.py`)
 
 ```text
-             +------------------+
-             | unknown identity |
-             +--------+---------+
-                      |
-                      v
-                     ss1
-                      |
-              (name known & not greeted)
-                      v
-                     ss2
-                      |
-             (greeted today = yes)
-                      v
-                     ss3
-                      |
-             (talked today = yes)
-                      v
-                     ss4
+        face_id unknown
+              |
+              v
+             ss1  (Unknown — ask name)
+              |
+        name registered
+              |
+              v
+             ss2  (Known, not yet greeted today)
+              |
+        greeted_today = yes
+              |
+              v
+             ss3  (Greeted, not yet talked today)
+              |
+        talked_today = yes
+              |
+              v
+             ss4  (Fully interacted — no proactive re-approach today)
 ```
 
-## 4.2 Hunger state (`executiveControl.py`)
+Social state resets daily. `greeted_today.json` and `talked_today.json` hold the current day's flags.
+
+### 4.2 Hunger state (managed by `HungerModel` in `executiveControl.py`)
 
 ```text
-level >= hungry_threshold                     -> HS1
-starving_threshold <= level < hungry_threshold -> HS2
-level < starving_threshold                    -> HS3
+level >= 60%          → HS1  (normal)
+25% <= level < 60%    → HS2  (hungry)
+level < 25%           → HS3  (starving)
 ```
 
-## 4.3 Chatbot hunger fallback
+### 4.3 Chatbot effective hunger
 
 ```text
-hunger stale and no manual override -> effective HS1
-manual override active              -> use overridden HS directly
+hunger stream fresh and no override  → use raw hunger state from stream
+hunger stale (> 60 s) and no override → force effective state to HS1
+manual override active               → use overridden state regardless of staleness
 ```
 
 ---
 
 ## 5) Failure and Abort Paths
 
-This section describes what happens when interactions fail, inputs disappear, or services are temporarily unavailable.
-
-## 5.1 Proactive interaction abort path (`executiveControl.py`)
+### 5.1 Target monitor (proactive interaction abort)
 
 ```text
-run(track, face, ss)
-  |
-  +--> start target monitor
-  |
-  +--> execute tree
-        |
-        +--> target present? yes --> continue
-        |
-        +--> target absent > TARGET_LOST_TIMEOUT
-             -> set abort_event
-             -> stop current waits (STT/LLM/speech wait)
-             -> return result with abort_reason
+monitor thread checks landmarks every ~67 ms
+  → face present           → last_seen reset
+  → face absent > 12 s     → abort_event set
+                              → stops all waits (STT / LLM / speech)
+                              → returns result with abort_reason = "target_lost"
 ```
 
-## 5.2 No-response path (social trees)
+Thread starvation guard: if the monitor thread stalls for > 1.5 s (e.g. system load), `last_seen` is advanced to prevent false aborts.
+
+### 5.2 No-response paths per social tree
 
 ```text
 SS1:
-  greeting -> no user response -> abort no_response_greeting
-  ask name -> no response      -> abort no_response_name
-  name extraction fail (incl retry) -> abort name_extraction_failed
+  greeting → no response                   → abort no_response_greeting
+  ask name → no response                   → abort no_response_name
+  name extraction fails (incl. retry)      → abort name_extraction_failed
 
 SS2:
-  greet attempt #1 no response -> attempt #2
-  greet attempt #2 no response -> abort no_response_greeting
+  attempt 1 no response → attempt 2
+  attempt 2 no response                    → abort no_response_greeting
 
 SS3:
-  starter sent
-  no user utterance in timeout -> abort no_response_conversation
+  starter sent, no utterance in 12 s       → abort no_response_conversation
 ```
 
-## 5.3 Responsive gating path (drop, don’t defer)
+### 5.3 Responsive event gating
 
 ```text
-responsive event arrives
+STT greeting or QR arrives
   |
-  +--> proactive interaction running?
-        |
-        +--> yes: drop event immediately
-        +--> no : execute responsive action now
+  +--> proactive running?  yes → drop immediately (never deferred or queued)
+  +--> proactive running?  no  → execute now
 ```
 
-## 5.4 Salience → executive call protection
+### 5.4 Salience → executive gate
 
 ```text
-candidate selected in salience
+candidate selected
   |
-  +--> cooldown passed?
-  +--> eligible?
-  +--> executive RPC reachable?
-  +--> executive status busy?
+  +--> cooldown elapsed?
+  +--> IPS >= SS threshold?
+  +--> executiveControl RPC reachable?
+  +--> executiveControl not busy?
 
-if any gate fails: skip run now, continue tracking
-if all pass     : start interaction thread
+any gate fails → skip, keep tracking, retry next cycle
+all pass       → spawn interaction thread
 ```
 
-## 5.5 Queue pressure and backpressure behavior
+### 5.5 Queue pressure
 
 ```text
-queue full (DB/IO/responsive/telegram updates)
-  -> drop oldest
-  -> enqueue newest if possible
-  -> continue module loop (non-blocking)
+any internal queue full (DB / IO / responsive / Telegram)
+  → drop oldest entry
+  → enqueue newest
+  → main loop continues without blocking
 ```
 
-## 5.6 Chatbot stale hunger safety
+### 5.6 Stale hunger (chatBot)
 
 ```text
-no fresh hunger update for HS_STALE_SEC
-  -> effective hunger forced to HS1
-  -> avoids stale HS2/HS3 behavior
-manual override active
-  -> stale protection bypassed
+no fresh hunger update for 60 s (and no manual override)
+  → effective hunger forced to HS1
+  → prevents stale HS2/HS3 persona from persisting after disconnection
+```
+
+### 5.7 LLM unavailability
+
+```text
+LLM call fails or times out
+  → executiveControl: returns fallback string from prompts.json (interaction continues)
+  → chatBot: returns hunger-appropriate fallback string (message still sent)
 ```
 
 ---
 
 ## 6) YARP Interfaces
 
-## 6.1 Core stream wiring
+### 6.1 Core stream wiring
 
 ```bash
+# Perception → Selection
 yarp connect /alwayson/vision/landmarks:o /alwayson/salienceNetwork/landmarks:i
+
+# Selection → Vision (target command loop)
 yarp connect /alwayson/salienceNetwork/targetCmd:o /alwayson/vision/targetCmd:i
+
+# Vision → FaceTracker (hardware gaze control)
 yarp connect /alwayson/vision/targetBox:o /faceTracker/target:i
 
+# Vision → Executive (QR codes)
 yarp connect /alwayson/vision/qr:o /alwayson/executiveControl/qr:i
+
+# Speech pipeline
 yarp connect /speech2text/text:o /alwayson/executiveControl/stt:i
 yarp connect /alwayson/executiveControl/speech:o /acapelaSpeak/speech:i
 
+# Hunger stream
 yarp connect /alwayson/executiveControl/hunger:o /alwayson/chatBot/hunger:i
 ```
 
 Optional:
 
 ```bash
+# STM context for adaptive cooldown
 yarp connect /alwayson/stm/context:o /alwayson/salienceNetwork/context:i
 ```
 
-## 6.2 RPC endpoints
+### 6.2 RPC endpoints
 
-- `salienceNetwork`
-  - `set_track_id <int>`
-  - `reset_cooldown <face_id> <track_id>`
-- `executiveControl`
-  - `status`, `ping`, `help`
-  - `run <track_id> <face_id> <ss1|ss2|ss3|ss4>`
-  - `hunger <hs1|hs2|hs3>`
-  - `quit`
-- `chatBot`
-  - `status`
-  - `set_hs HS1|HS2|HS3`
-  - `reload_prompts`
-- `vision`
-  - `name <person_name> id <track_id>`
-  - `help`, `process on/off`, `quit`
+| Module | Command | Description |
+|---|---|---|
+| `vision` | `name <name> id <track_id>` | Enroll face identity at runtime |
+| `vision` | `help`, `process on/off`, `quit` | Module control |
+| `salienceNetwork` | `set_track_id <int>` | Force attention target (override IPS) |
+| `salienceNetwork` | `reset_cooldown <face_id> <track_id>` | Clear interaction cooldown for a person |
+| `executiveControl` | `run <track_id> <face_id> <ss>` | Manually trigger an interaction |
+| `executiveControl` | `hunger <hs1\|hs2\|hs3>` | Manually set stomach level |
+| `executiveControl` | `status`, `ping`, `help`, `quit` | Module control |
+| `chatBot` | `status` | Returns hunger state, subscribers, thread health |
+| `chatBot` | `set_hs HS1\|HS2\|HS3` | Override effective hunger persona |
+| `chatBot` | `reload_prompts` | Hot-reload prompts.json |
 
 ---
 
-## 7) Persistence and Logging
+## 7) Persistence and Memory
 
-## 7.0 Memory architecture (what is remembered)
+### 7.1 Memory architecture
 
-The system memory is split into **episodic interaction memory**, **daily social memory**,
-**person-level adaptive memory**, and **chat relationship memory**:
-
-```text
-            +----------------------------+
-            |  Episodic interaction logs |
-            |  (SQLite rows, timestamps) |
-            +-------------+--------------+
-                          |
-                          v
-            +----------------------------+
-            | Daily social memory        |
-            | greeted_today / talked_today|
-            +-------------+--------------+
-                          |
-                          v
-            +----------------------------+
-            | Person adaptive memory     |
-            | learning.json weights      |
-            +-------------+--------------+
-                          |
-                          v
-            +----------------------------+
-            | Chat relationship memory   |
-            | chat_bot.db user/chat mem  |
-            +----------------------------+
-```
-
-### Who writes what
-
-- `salienceNetwork.py`
-  - reads/writes: `greeted_today.json`, `talked_today.json`, `learning.json`
-  - logs to: `salience_network.db`
-- `executiveControl.py`
-  - writes: `last_greeted.json`, `greeted_today.json`, `hunger_state.json`
-  - logs to: `executive_control.db`
-- `chatBot.py`
-  - writes: `chat_bot.db` (`meta`, `subscribers`, `chat_memory`, `user_memory`)
-
-Runtime path resolution note:
-
-- `chatBot.py` and `executiveControl.py` resolve `chat_bot.db` from parent `alwaysOn/memory` at runtime.
-- `hunger_state.json` is also resolved from parent `alwaysOn/memory` at runtime.
-- Paths shown below as `memory/...` are logical storage names; deployment may map them outside this workspace folder.
-
-### Memory write safety model
+Four layers of memory across increasing time scales:
 
 ```text
-producer module
-   -> enqueue write/log event
-   -> background worker drains queue
-   -> atomic file replace / sqlite commit
-   -> main loop keeps running (non-blocking)
+Frame scale (milliseconds)
+  vision.py → face geometry, gaze, talking signal (ephemeral, not stored)
+
+Interaction scale (seconds / minutes)
+  executiveControl.db → proactive and responsive interaction records
+
+Day scale
+  greeted_today.json  → who was greeted today (drives ss2 → ss3)
+  talked_today.json   → who was talked to today (drives ss3 → ss4)
+  last_greeted.json   → timestamp of last greet per person
+
+Long-term person scale (across sessions)
+  learning.json       → per-person IPS weights (adapts selection behavior)
+
+Relationship scale (permanent)
+  chat_bot.db         → Telegram chat history, summaries, user profiles
 ```
 
-### SQLite
+### 7.2 Who writes what
 
-- `memory/chat_bot.db` (logical name; runtime-resolved under parent `alwaysOn/memory`)
-  - `meta`, `subscribers`, `chat_memory`, `user_memory`
-- `.../data_collection/executive_control.db`
-  - proactive + responsive interaction records
-- `.../data_collection/salience_network.db`
-  - target selections, SS changes, learning changes, interaction attempts
+| Module | Writes |
+|---|---|
+| `salienceNetwork.py` | `greeted_today.json`, `talked_today.json`, `learning.json`, `salience_network.db` |
+| `executiveControl.py` | `last_greeted.json`, `greeted_today.json`, `hunger_state.json`, `executive_control.db` |
+| `chatBot.py` | `chat_bot.db` (`meta`, `subscribers`, `chat_memory`, `user_memory`) |
 
-### JSON
+### 7.3 Write safety model
 
-- `.../memory/greeted_today.json`
-- `.../memory/talked_today.json`
-- `.../memory/last_greeted.json`
-- `.../memory/learning.json`
-- `memory/hunger_state.json` (logical name; runtime-resolved under parent `alwaysOn/memory`)
-
-### Persistence strategy
+All writes are non-blocking from the main loop:
 
 ```text
-runtime updates -> queue -> background worker -> atomic write/commit
+module main loop
+  → enqueue write/log event
+  → background worker drains queue
+  → atomic file replace (tempfile + os.replace) or SQLite WAL commit
+  → main loop never stalls on I/O
 ```
 
-## 7.4 Memory semantics by timescale
+### 7.4 SQLite databases
 
-- **Frame scale (milliseconds):** face geometry, gaze, speaking signal (`vision.py`)
-- **Interaction scale (seconds/minutes):** run outcome, abort reason, transcript snippets
-- **Day scale:** greeted/talked flags drive `ss1..ss4`
-- **Long-term person scale:** adaptive IPS weights in `learning.json`
-- **Relationship scale:** chatbot profile + chat summaries in `chat_bot.db`
+| Database | Tables | Contents |
+|---|---|---|
+| `data_collection/executive_control.db` | `interactions` | Proactive and responsive interaction records |
+| `data_collection/salience_network.db` | `target_selections`, `ss_changes`, `learning_changes` | Selection events and learning deltas |
+| `memory/chat_bot.db` | `meta`, `subscribers`, `chat_memory`, `user_memory` | Telegram state, per-chat history, per-user profiles |
+
+### 7.5 JSON files
+
+```text
+memory/greeted_today.json     → {face_id: date_string}
+memory/talked_today.json      → {face_id: date_string}
+memory/last_greeted.json      → {face_id: {name, timestamp, ...}}
+memory/learning.json          → {person_id: {w_prox, w_cent, w_vel, w_gaze}}
+memory/hunger_state.json      → {level, last_update_ts, last_feed_ts, last_feed_payload}
+```
 
 ---
 
@@ -776,43 +849,52 @@ runtime updates -> queue -> background worker -> atomic write/commit
 
 ```text
 vision.py
-  - main RFModule loop
-  - lock-protected face identity maps
+  - main RFModule loop (detection, landmarks, target delegation)
+  - _face_identity_lock  (guards identity maps)
 
 salienceNetwork.py
-  - main loop
-  - interaction thread
-  - IO worker + DB worker + last_greeted refresh thread
+  - main loop (IPS scoring, arbitration, target cmd)
+  - interaction thread (runs RPC call + waits for result)
+  - IO worker thread (JSON reads/writes)
+  - DB worker thread (SQLite inserts)
+  - last_greeted refresh thread (periodic background refresh)
+  - RPC prewarm thread (background connection attempt on startup)
 
 executiveControl.py
-  - main loop
-  - target monitor thread
-  - QR reader thread
-  - responsive loop thread
-  - async LLM worker thread
-  - DB worker thread
+  - main loop (hunger drain + publish)
+  - target monitor thread (per-interaction)
+  - landmarks reader thread (continuous)
+  - QR reader thread (continuous)
+  - responsive loop thread (continuous)
+  - async LLM worker thread (request queue drain)
+  - DB worker thread (SQLite inserts)
 
 chatBot.py
-  - main loop
-  - Telegram polling thread + update queue
+  - main loop (hunger read + update drain + HS3 broadcast)
+  - Telegram polling thread (long-poll + update queue)
 ```
 
 ---
 
 ## 9) Startup Order
 
-1. Start `yarpserver`.
-2. Start `vision.py`.
-3. Start `salienceNetwork.py`.
-4. Start `executiveControl.py`.
-5. Start `chatBot.py`.
-6. Connect YARP ports.
-7. Optional: run `mockPublisher.py` for synthetic testing.
+```text
+1. yarpserver
+2. vision.py
+3. salienceNetwork.py
+4. executiveControl.py
+5. chatBot.py
+6. Connect YARP ports (see §6.1)
+7. Optional: mockPublisher.py for testing without full upstream stack
+```
 
 ---
 
-## 10) Operational Behavior Guarantees
+## 10) Operational Guarantees
 
-- `executiveControl` proactive and responsive paths are mutually exclusive.
-- `salienceNetwork` can keep running even if STM context is not connected yet.
-- `chatBot` protects against stale hunger streams via effective-state fallback.
+- Proactive and responsive execution paths are mutually exclusive — responsive events are dropped (not deferred) while a proactive interaction runs.
+- `salienceNetwork` starts and runs without STM context connected — the context port is optional and can be connected at any time.
+- `chatBot` is safe against disconnected `executiveControl` — stale hunger falls back to HS1 after 60 s.
+- All LLM calls have fallback strings — no interaction or Telegram reply ever blocks indefinitely on LLM availability.
+- All file I/O and DB writes are off the main loop — latency spikes in storage never stall perception or interaction.
+- The hunger level survives restarts — `HungerModel` loads `hunger_state.json` on startup and continues draining from the saved level.
