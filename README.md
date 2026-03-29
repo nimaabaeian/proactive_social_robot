@@ -100,6 +100,7 @@ Perception stream (high rate) ---> Selection gate ---> Interaction transaction -
 - Publishes one rich landmark bottle per face.
 - Publishes scene-level compact features.
 - Receives selected target (`track_id`, `ips`) and sends FaceTracker-compatible bbox command.
+- Drains camera-input backlog and processes the freshest frame to reduce display lag/stutter.
 - Supports runtime naming over RPC: `name <person_name> id <track_id>`.
 
 ### Per-face output model
@@ -183,7 +184,7 @@ LAYER B: DIALOGUE (start proactive interaction)
 
 ```text
 IPS = weighted_sum(proximity, centricity, approach_velocity, gaze)
-      * habituation_decay(time_idle)
+  * optional_habituation_decay(time_idle)
       + hysteresis_bonus(if same target)
 ```
 
@@ -222,14 +223,19 @@ w_prox=0.5, w_cent=0.15, w_vel=0.3, w_gaze=0.5
 base_ips = w_prox*s_prox + w_cent*s_cent + w_vel*s_vel + w_gaze*s_gaze
 ```
 
-3) **Apply habituation decay**
+3) **Apply habituation decay (conditional)**
 
 ```text
+Habituation is applied only to the current tracked face, and only when:
+  - interaction_busy == false
+  - more than one face is visible
+  - at least one competing face currently has higher IPS
+
 time_since_last_interaction = now - last_interaction_time(cooldown_key)
 t_idle = min(time_in_view, time_since_last_interaction)
 habituation = exp(-lambda * t_idle), lambda = 0.05
 
-ips = base_ips * habituation
+ips_current_target = base_ips_current_target * habituation
 ```
 
 4) **Apply hysteresis bonus**
@@ -250,7 +256,15 @@ Eligibility thresholds by social state:
   ss3 >= 1.2
   ss4 >= 99.0  (effectively never proactive)
 
-Tracking gate (look-only): target IPS must also pass min_track_ips (default 0.6)
+Tracking gate (look-only): target IPS must also pass min_track_ips (default 0.9)
+
+Tracking stop behavior includes hysteresis + debounce:
+  start/switch threshold = min_track_ips (default 0.9)
+  stop threshold         = min_track_ips - track_stop_hysteresis (default 0.8)
+  stop debounce          = track_stop_debounce_sec (default 2.0s)
+
+Target command stream is event-driven with keepalive resend:
+  keepalive period = target_cmd_keepalive_sec (default 0.5s)
 ```
 
 ### How it is adaptive
@@ -258,7 +272,7 @@ Tracking gate (look-only): target IPS must also pass min_track_ips (default 0.6)
 `salienceNetwork.py` adapts online in two ways:
 
 1. **Short-term adaptation (within session)**
-  - Habituation decay lowers IPS while a person stays in view without interaction.
+  - Habituation decay is applied only in competitive multi-face moments (reduces lock-in to the current target).
   - Hysteresis bonus stabilizes the current target and prevents noisy switching.
 
 2. **Long-term adaptation (across sessions)**
