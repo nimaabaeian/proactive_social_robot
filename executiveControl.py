@@ -812,8 +812,9 @@ class ExecutiveControlModule(yarp.RFModule):
                 result["logs"] = self.log_buffer.copy()
                 return result
 
-        # Start target monitor
+        # Start target monitor and lock gaze onto target
         self._start_monitor(track_id, result)
+        self._set_selector_track_override(track_id)
 
         try:
             hs = self.hunger.get_state()
@@ -840,8 +841,9 @@ class ExecutiveControlModule(yarp.RFModule):
             self._log("ERROR", f"Tree execution error: {e}")
             result["abort_reason"] = f"exception: {e}"
 
-        # Stop monitor
+        # Stop monitor and release gaze override
         self._stop_monitor()
+        self._set_selector_track_override(-1)
 
         result["logs"] = self.log_buffer.copy()
         return result
@@ -1607,12 +1609,17 @@ class ExecutiveControlModule(yarp.RFModule):
     def _responsive_cooldown_key(face_id: str, track_id: int, is_known: bool) -> str:
         return face_id if is_known else f"unknown:{track_id}"
 
-    def _responsive_single_candidate(self) -> Optional[Tuple[int, str, bool]]:
-        """Find the best candidate for responsive greeting.
+    _RESPONSIVE_GAZE_STATES = frozenset({"MUTUAL_GAZE", "NEAR_GAZE"})
 
-        Returns the biggest-bbox face as (track_id, face_id, is_known).
-        Gaze/attention is NOT required — the utterance itself is sufficient
-        signal that the person is addressing the robot.
+    def _responsive_single_candidate(self) -> Optional[Tuple[int, str, bool]]:
+        """Find the best candidate for a voice-triggered responsive greeting.
+
+        Only faces whose attention state is MUTUAL_GAZE or NEAR_GAZE are
+        considered — the person must be oriented toward the robot for a
+        voice-triggered greeting to be directed at them.  Among qualifying
+        faces the one with the largest bounding box is selected.
+
+        Returns (track_id, face_id, is_known) or None.
         """
         with self._faces_lock:
             age = time.time() - self._latest_faces_ts
@@ -1631,6 +1638,10 @@ class ExecutiveControlModule(yarp.RFModule):
         )  # (track_id, face_id, area, is_known)
 
         for face in faces:
+            attention = face.get("attention", "")
+            if attention not in self._RESPONSIVE_GAZE_STATES:
+                continue
+
             face_id = str(face.get("face_id", "")).strip()
             track_id = face.get("track_id")
             bbox = face.get("bbox", [0, 0, 0, 0])
@@ -1647,10 +1658,13 @@ class ExecutiveControlModule(yarp.RFModule):
             candidates.append((track_id, face_id, area, is_known))
 
         if not candidates:
-            self._log("DEBUG", f"Responsive: no usable faces from {len(faces)} total")
+            self._log(
+                "DEBUG",
+                f"Responsive: no MUTUAL_GAZE/NEAR_GAZE face from {len(faces)} total",
+            )
             return None
 
-        # Pick biggest bbox among visible faces
+        # Pick biggest bbox among gaze-qualifying faces
         best = max(candidates, key=lambda c: c[2])
         known_label = "known" if best[3] else "unknown"
         self._log(

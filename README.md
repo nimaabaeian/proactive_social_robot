@@ -184,6 +184,8 @@ It also updates per-person adaptive weights after each interaction outcome.
 LAYER A — ATTENTION (head/eye gaze target)
   Priority order:
     1) RPC override track_id (set_track_id command)
+       — set at start of every interaction (proactive or responsive),
+         released (-1) when the interaction ends
     2) Active interaction lock (holds gaze on current partner)
     3) Highest IPS face
 
@@ -431,9 +433,10 @@ Event arrives
   |
   +--> event type:
         greeting in STT ("hello", "hi", "hey", "ciao", "buongiorno")
-          + MUTUAL_GAZE or NEAR_GAZE attention required
+          + person must be in MUTUAL_GAZE or NEAR_GAZE attention state
+          + if multiple qualifying faces, largest bounding-box face is selected
           + 10 s per-face cooldown
-          → greet/intro response to largest visible face
+          → greet/intro response to selected face
 
         QR feed outside proactive
           → short acknowledgment
