@@ -232,10 +232,9 @@ if face.track_id == current_target:
 
 **Step 4 — Habituation decay (conditional)**
 
-Applied only to the current tracked face and only when all three are true:
-- interaction is not running
+Applied only to the current tracked face and only when both are true:
+- interaction is not running (stops immediately when any proactive or responsive interaction begins)
 - more than one face is visible
-- at least one competing face currently has higher IPS
 
 ```text
 t_idle      = min(time_in_view, time_since_last_interaction)
