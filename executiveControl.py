@@ -360,6 +360,7 @@ class ExecutiveControlModule(yarp.RFModule):
 
         # Hunger and QR
         self.hunger = HungerModel(persist_file=self.HUNGER_STATE_FILE)
+        self.hunger_enabled = True
         self.hunger_port: Optional[yarp.BufferedPortBottle] = (
             None  # output to chatBot
         )
@@ -568,10 +569,11 @@ class ExecutiveControlModule(yarp.RFModule):
         return self.period
 
     def updateModule(self) -> bool:
-        self.hunger.update()
-        # Publish current hunger state so chatBot (and any other subscriber) can read it.
-        if self.hunger_port:
+        if self.hunger_enabled:
+            self.hunger.update()
             hs = self.hunger.get_state()
+            # Publish current hunger state so chatBot (and any other subscriber) can read it.
+        if self.hunger_enabled and self.hunger_port:
             b = self.hunger_port.prepare()
             b.clear()
             b.addString(hs)
@@ -591,6 +593,13 @@ class ExecutiveControlModule(yarp.RFModule):
             if command in ["status", "ping"]:
                 is_locked = self._is_run_lock_busy()
                 busy = is_locked or self._responsive_active.is_set()
+                if self.hunger_enabled:
+                    hs = self.hunger.get_state()
+                    with self.hunger._lock:
+                        hunger_level = self.hunger.level
+                else:
+                    hs = "HS1"
+                    hunger_level = 100.0
                 return self._reply_ok(
                     reply,
                     {
@@ -598,6 +607,9 @@ class ExecutiveControlModule(yarp.RFModule):
                         "status": "ready",
                         "module": self.module_name,
                         "busy": busy,
+                        "hunger_enabled": self.hunger_enabled,
+                        "hunger_state": hs,
+                        "hunger_level": hunger_level,
                     },
                 )
 
@@ -606,6 +618,7 @@ class ExecutiveControlModule(yarp.RFModule):
                 reply.addString(
                     "run <track_id> <face_id> <ss1|ss2|ss3|ss4>  -- start interaction\n"
                     "hunger <hs1|hs2|hs3>                         -- set hunger (hs1=full, hs2=hungry, hs3=starving)\n"
+                    "hunger_mode <on|off>                         -- enable/disable hunger functionality (resets to 100%)\n"
                     "status                                        -- check if busy\n"
                     "quit                                          -- shut down"
                 )
@@ -618,7 +631,20 @@ class ExecutiveControlModule(yarp.RFModule):
                     reply, {"success": True, "message": "Shutting down"}
                 )
 
+            if command == "hunger_mode":
+                if cmd.size() < 2:
+                    return self._reply_error(reply, "Usage: hunger_mode <on|off>")
+                mode_arg = cmd.get(1).asString().strip().lower()
+                if mode_arg not in ("on", "off"):
+                    return self._reply_error(reply, "Usage: hunger_mode <on|off>")
+                mode_info = self._set_hunger_mode(mode_arg == "on")
+                return self._reply_ok(reply, {"success": True, **mode_info})
+
             if command == "hunger":
+                if not self.hunger_enabled:
+                    return self._reply_error(
+                        reply, "Hunger mode is OFF. Use: hunger_mode on"
+                    )
                 if cmd.size() < 2:
                     return self._reply_error(reply, "Usage: hunger <hs1|hs2|hs3>")
                 level_arg = cmd.get(1).asString().lower()
@@ -781,6 +807,17 @@ class ExecutiveControlModule(yarp.RFModule):
             self.run_lock.release()
         return is_locked
 
+    def _set_hunger_mode(self, enabled: bool) -> Dict[str, Any]:
+        self.hunger_enabled = bool(enabled)
+        self.hunger.set_level(100.0, now=time.time())
+        mode = "ON" if self.hunger_enabled else "OFF"
+        self._log("INFO", f"Hunger mode set to {mode}; reset to 100.0%")
+        return {
+            "hunger_enabled": self.hunger_enabled,
+            "hunger_state": "HS1" if not self.hunger_enabled else self.hunger.get_state(),
+            "hunger_level": 100.0,
+        }
+
     # ==================== Interaction Execution ====================
 
     def _execute_interaction(
@@ -821,13 +858,18 @@ class ExecutiveControlModule(yarp.RFModule):
         self._set_selector_track_override(track_id)
 
         try:
-            hs = self.hunger.get_state()
+            if self.hunger_enabled:
+                hs = self.hunger.get_state()
+                with self.hunger._lock:
+                    stomach_level_start = self.hunger.level
+            else:
+                hs = "HS1"
+                stomach_level_start = 100.0
             result["hunger_state_start"] = hs
-            with self.hunger._lock:
-                result["stomach_level_start"] = self.hunger.level
+            result["stomach_level_start"] = stomach_level_start
             result["interaction_tag"] = f"{social_state.upper()}{hs}"
 
-            if hs == "HS3" or (hs == "HS2" and social_state == "ss3"):
+            if self.hunger_enabled and (hs == "HS3" or (hs == "HS2" and social_state == "ss3")):
                 self._run_hunger_feed_tree(track_id, face_id, social_state, hs, result)
             else:
                 if social_state == "ss1":
@@ -837,10 +879,15 @@ class ExecutiveControlModule(yarp.RFModule):
                 elif social_state == "ss3":
                     self._run_ss3_tree(track_id, face_id, result)
 
-            hs_end = self.hunger.get_state()
+            if self.hunger_enabled:
+                hs_end = self.hunger.get_state()
+                with self.hunger._lock:
+                    stomach_level_end = self.hunger.level
+            else:
+                hs_end = "HS1"
+                stomach_level_end = 100.0
             result["hunger_state_end"] = hs_end
-            with self.hunger._lock:
-                result["stomach_level_end"] = self.hunger.level
+            result["stomach_level_end"] = stomach_level_end
         except Exception as e:
             self._log("ERROR", f"Tree execution error: {e}")
             result["abort_reason"] = f"exception: {e}"
@@ -1469,6 +1516,10 @@ class ExecutiveControlModule(yarp.RFModule):
                 raw_val = btl.get(0).asString()
                 val = self._normalize_qr_payload(raw_val)
                 if val and val in self._meal_mapping:
+                    if not self.hunger_enabled:
+                        self._log("DEBUG", f"Ignoring QR '{val}' (hunger mode OFF)")
+                        time.sleep(0.02)
+                        continue
                     now = time.time()
                     if now - self._last_scan_ts < self._qr_cooldown_sec:
                         time.sleep(0.02)

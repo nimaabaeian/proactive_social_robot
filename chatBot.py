@@ -36,6 +36,7 @@ class ChatBotModule(yarp.RFModule):
     MODULE_HZ: float = 10.0
 
     VALID_HS = {"HS1", "HS2", "HS3"}
+    NO_HUNGER_HS = "HS0"
     HS_STALE_SEC: float = 60.0
 
     DEFAULT_TZ: str = "Europe/Rome"  # local timezone for time-of-day context
@@ -377,10 +378,10 @@ class ChatBotModule(yarp.RFModule):
 
     def _effective_hs(self) -> str:
         if self._is_hs_stale():
-            if not self._stale_warned and self._raw_hs != "HS1":
-                self._log("WARN", f"Hunger stale ({self._raw_hs}); using HS1")
+            if not self._stale_warned:
+                self._log("WARN", f"Hunger stale ({self._raw_hs}); hunger drive unavailable")
                 self._stale_warned = True
-            return "HS1"
+            return self.NO_HUNGER_HS
         self._stale_warned = False
         return self._raw_hs
 
