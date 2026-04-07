@@ -171,8 +171,31 @@ class ChatBotModule(yarp.RFModule):
                     data_json  TEXT    NOT NULL DEFAULT '{}',
                     updated_at INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS chat_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp INTEGER NOT NULL,
+                    day_rome TEXT NOT NULL,
+                    chat_id INTEGER,
+                    event_type TEXT NOT NULL,
+                    hs TEXT,
+                    user_chars INTEGER,
+                    assistant_chars INTEGER,
+                    hunger_mentioned INTEGER,
+                    llm_fallback INTEGER,
+                    broadcast_mode TEXT,
+                    note TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_chat_events_ts ON chat_events(timestamp);
+                CREATE INDEX IF NOT EXISTS idx_chat_events_day ON chat_events(day_rome);
+                CREATE INDEX IF NOT EXISTS idx_chat_events_chat_id ON chat_events(chat_id);
+                CREATE INDEX IF NOT EXISTS idx_chat_events_type ON chat_events(event_type);
+                CREATE INDEX IF NOT EXISTS idx_subscribers_last_seen ON subscribers(last_seen_at);
+                CREATE INDEX IF NOT EXISTS idx_subscribers_last_broadcast ON subscribers(last_broadcast_at);
+                CREATE INDEX IF NOT EXISTS idx_chat_memory_updated ON chat_memory(updated_at);
+                CREATE INDEX IF NOT EXISTS idx_user_memory_updated ON user_memory(updated_at);
                 """
             )
+            self._create_analytics_views()
             self._db.commit()
 
             self._tg_token = self._get_env("TELEGRAM_BOT_TOKEN")
@@ -530,8 +553,8 @@ class ChatBotModule(yarp.RFModule):
         self._on_text(chat_id, text, msg_date=msg_date)
 
     def _on_start(self, chat_id: int, msg: Optional[Dict[str, Any]] = None) -> None:
-        self._db_upsert_subscriber(chat_id)
-        self._db_clear_memory(chat_id)
+        self._db_upsert_subscriber(chat_id, commit=False)
+        self._db_clear_memory(chat_id, commit=False)
         if msg:
             self._update_user_from_message(chat_id, msg, "")
         name = self._get_user_record(chat_id).get("name") or ""
@@ -541,22 +564,49 @@ class ChatBotModule(yarp.RFModule):
         else:
             greeting = self._prompts.get("start_greeting", "hey! i'm iCub 😊 what's on your mind?")
         self._tg_send(chat_id, greeting)
+        self._db_log_event(
+            event_type="start",
+            chat_id=chat_id,
+            hs=self._effective_hs(),
+            assistant_chars=len(greeting),
+            note="command:/start",
+            commit=False,
+        )
+        self._db_commit()
         self._log("INFO", f"/start from {chat_id}")
 
     def _on_reset(self, chat_id: int) -> None:
-        self._db_clear_memory(chat_id)
-        self._tg_send(chat_id, self._prompts.get("reset_reply", "ok let's start fresh 👍"))
+        self._db_clear_memory(chat_id, commit=False)
+        reset_reply = self._prompts.get("reset_reply", "ok let's start fresh 👍")
+        self._tg_send(chat_id, reset_reply)
+        self._db_log_event(
+            event_type="reset",
+            chat_id=chat_id,
+            hs=self._effective_hs(),
+            assistant_chars=len(reset_reply),
+            note="command:/reset",
+            commit=False,
+        )
+        self._db_commit()
         self._log("INFO", f"/reset from {chat_id}")
 
     def _on_text(self, chat_id: int, user_text: str, msg_date: int = 0) -> None:
-        self._db_upsert_subscriber(chat_id)
-        self._db_touch_subscriber(chat_id)
+        self._db_upsert_subscriber(chat_id, commit=False)
+        self._db_touch_subscriber(chat_id, commit=False)
 
         hs = self._effective_hs()
         summary, history, turn_count = self._db_load_memory(chat_id)
         user_record = self._get_user_record(chat_id)
 
         user_text = (user_text or "")[: self.MAX_USER_CHARS]
+        self._db_log_event(
+            event_type="user_message",
+            chat_id=chat_id,
+            hs=hs,
+            user_chars=len(user_text),
+            note="incoming_text",
+            commit=False,
+        )
 
         messages: List[Dict[str, str]] = [{"role": "system", "content": self._system_prompt(hs)}]
 
@@ -626,7 +676,9 @@ class ChatBotModule(yarp.RFModule):
 
         self._tg_typing(chat_id)
 
-        reply_text = self._llm_chat(messages) or self._fallback(hs)
+        llm_reply = self._llm_chat(messages)
+        used_fallback = not bool(llm_reply)
+        reply_text = llm_reply or self._fallback(hs)
         self._tg_send(chat_id, reply_text)
 
         if hs == "HS2":  # update hunger counter
@@ -646,7 +698,21 @@ class ChatBotModule(yarp.RFModule):
             if new_summary:
                 summary = new_summary
 
-        self._db_save_memory(chat_id, summary, history, turn_count)
+        hunger_mentioned = 1 if self._reply_mentions_hunger(reply_text) else 0
+        self._db_log_event(
+            event_type="assistant_reply",
+            chat_id=chat_id,
+            hs=hs,
+            user_chars=len(user_text),
+            assistant_chars=len(reply_text),
+            hunger_mentioned=hunger_mentioned,
+            llm_fallback=1 if used_fallback else 0,
+            note=("hs2_forced" if hs2_forced else ""),
+            commit=False,
+        )
+
+        self._db_save_memory(chat_id, summary, history, turn_count, commit=False)
+        self._db_commit()
 
     # ------------------------- HS3 Broadcast -------------------------
     def _maybe_hs3_broadcast(self) -> None:
@@ -668,6 +734,7 @@ class ChatBotModule(yarp.RFModule):
 
         text = self._llm_hs3_broadcast() or self._prompts.get("hs3_broadcast_fallback", "pls come feed me in person i'm so hungry 😭 i really need food RIGHT NOW")
 
+        sent_any = False
         for chat_id in candidates:
             # Skip-recent guard only applies to periodic cooldown re-broadcasts,
             # NOT on entry: when the robot just became starving everyone must be notified.
@@ -677,8 +744,22 @@ class ChatBotModule(yarp.RFModule):
                     self._log("DEBUG", f"HS3 broadcast skipped -> {chat_id} (chatted {now - last_seen:.0f}s ago)")
                     continue
             self._tg_send(chat_id, text)
-            self._db_mark_broadcast(chat_id)
+            self._db_mark_broadcast(chat_id, commit=False)
+            self._db_log_event(
+                event_type="hs3_broadcast",
+                chat_id=chat_id,
+                hs="HS3",
+                assistant_chars=len(text),
+                hunger_mentioned=1,
+                broadcast_mode=("enter" if entering else "cooldown"),
+                note="broadcast_sent",
+                commit=False,
+            )
+            sent_any = True
             self._log("INFO", f"HS3 broadcast -> {chat_id} ({'enter' if entering else 'cooldown'})")
+
+        if sent_any:
+            self._db_commit()
 
     # ------------------------- LLM (Azure OpenAI) -------------------------
     def _build_llm_client(self) -> Tuple[AzureOpenAI, str, str]:
@@ -1390,7 +1471,105 @@ class ChatBotModule(yarp.RFModule):
         tz_abbr  = dt.strftime("%Z")            # CET / CEST
         return f"[{day_abbr} {day_num} {month} {year}, {time_str}, {tz_abbr}]"
 
+    def _create_analytics_views(self) -> None:
+        if not self._db:
+            return
+        self._db.execute("DROP VIEW IF EXISTS v_chat_events_clean")
+        self._db.execute(
+            """
+            CREATE VIEW v_chat_events_clean AS
+            SELECT
+                id,
+                timestamp,
+                day_rome,
+                chat_id,
+                event_type,
+                hs,
+                CAST(COALESCE(user_chars, 0) AS INTEGER) AS user_chars,
+                CAST(COALESCE(assistant_chars, 0) AS INTEGER) AS assistant_chars,
+                CAST(COALESCE(hunger_mentioned, 0) AS INTEGER) AS hunger_mentioned,
+                CAST(COALESCE(llm_fallback, 0) AS INTEGER) AS llm_fallback,
+                COALESCE(broadcast_mode, '') AS broadcast_mode,
+                COALESCE(note, '') AS note
+            FROM chat_events
+            """
+        )
+
+        self._db.execute("DROP VIEW IF EXISTS v_chat_daily_metrics")
+        self._db.execute(
+            """
+            CREATE VIEW v_chat_daily_metrics AS
+            SELECT
+                day_rome,
+                hs,
+                SUM(CASE WHEN event_type = 'user_message' THEN 1 ELSE 0 END) AS user_messages,
+                SUM(CASE WHEN event_type = 'assistant_reply' THEN 1 ELSE 0 END) AS bot_replies,
+                SUM(CASE WHEN event_type = 'hs3_broadcast' THEN 1 ELSE 0 END) AS hs3_broadcasts,
+                COUNT(DISTINCT CASE WHEN event_type IN ('user_message','assistant_reply') THEN chat_id END) AS active_users,
+                CASE
+                    WHEN SUM(CASE WHEN event_type = 'assistant_reply' THEN 1 ELSE 0 END) = 0 THEN 0.0
+                    ELSE 1.0 * SUM(CASE WHEN event_type = 'assistant_reply' THEN llm_fallback ELSE 0 END)
+                         / SUM(CASE WHEN event_type = 'assistant_reply' THEN 1 ELSE 0 END)
+                END AS fallback_rate,
+                CASE
+                    WHEN SUM(CASE WHEN event_type = 'assistant_reply' THEN 1 ELSE 0 END) = 0 THEN 0.0
+                    ELSE 1.0 * SUM(CASE WHEN event_type = 'assistant_reply' THEN hunger_mentioned ELSE 0 END)
+                         / SUM(CASE WHEN event_type = 'assistant_reply' THEN 1 ELSE 0 END)
+                END AS hunger_mention_rate,
+                AVG(CASE WHEN event_type = 'assistant_reply' THEN assistant_chars END) AS avg_reply_chars
+            FROM v_chat_events_clean
+            GROUP BY day_rome, hs
+            """
+        )
+
     # ------------------------- DB helpers -------------------------
+    def _db_commit(self) -> None:
+        if not self._db:
+            return
+        self._db.commit()
+
+    def _db_log_event(
+        self,
+        event_type: str,
+        chat_id: Optional[int] = None,
+        hs: Optional[str] = None,
+        user_chars: Optional[int] = None,
+        assistant_chars: Optional[int] = None,
+        hunger_mentioned: Optional[int] = None,
+        llm_fallback: Optional[int] = None,
+        broadcast_mode: Optional[str] = None,
+        note: str = "",
+        commit: bool = True,
+    ) -> None:
+        if not self._db:
+            return
+        now = int(time.time())
+        day_rome = datetime.now(ZoneInfo(self.DEFAULT_TZ)).date().isoformat()
+        self._db.execute(
+            """
+            INSERT INTO chat_events
+            (timestamp, day_rome, chat_id, event_type, hs,
+             user_chars, assistant_chars, hunger_mentioned, llm_fallback,
+             broadcast_mode, note)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                now,
+                day_rome,
+                int(chat_id) if chat_id is not None else None,
+                event_type,
+                hs,
+                int(user_chars) if user_chars is not None else None,
+                int(assistant_chars) if assistant_chars is not None else None,
+                int(hunger_mentioned) if hunger_mentioned is not None else None,
+                int(llm_fallback) if llm_fallback is not None else None,
+                broadcast_mode,
+                note,
+            ),
+        )
+        if commit:
+            self._db_commit()
+
     def _db_get_meta(self, key: str, default: str) -> str:
         if not self._db:
             return default
@@ -1414,7 +1593,7 @@ class ChatBotModule(yarp.RFModule):
         self._tg_last_offset_save = now
         self._db_set_meta("tg_offset", str(self._tg_offset))
 
-    def _db_upsert_subscriber(self, chat_id: int) -> None:
+    def _db_upsert_subscriber(self, chat_id: int, commit: bool = True) -> None:
         if not self._db:
             return
         now = int(time.time())
@@ -1423,16 +1602,18 @@ class ChatBotModule(yarp.RFModule):
             "ON CONFLICT(chat_id) DO UPDATE SET last_seen_at=excluded.last_seen_at",
             (int(chat_id), now, now),
         )
-        self._db.commit()
+        if commit:
+            self._db_commit()
 
-    def _db_touch_subscriber(self, chat_id: int) -> None:
+    def _db_touch_subscriber(self, chat_id: int, commit: bool = True) -> None:
         if not self._db:
             return
         self._db.execute(
             "UPDATE subscribers SET last_seen_at=? WHERE chat_id=?",
             (int(time.time()), int(chat_id)),
         )
-        self._db.commit()
+        if commit:
+            self._db_commit()
 
     def _db_list_subscribers(self) -> List[int]:
         if not self._db:
@@ -1449,14 +1630,15 @@ class ChatBotModule(yarp.RFModule):
         ).fetchall()
         return [int(r[0]) for r in rows]
 
-    def _db_mark_broadcast(self, chat_id: int) -> None:
+    def _db_mark_broadcast(self, chat_id: int, commit: bool = True) -> None:
         if not self._db:
             return
         self._db.execute(
             "UPDATE subscribers SET last_broadcast_at=? WHERE chat_id=?",
             (int(time.time()), int(chat_id)),
         )
-        self._db.commit()
+        if commit:
+            self._db_commit()
 
     def _db_subscriber_last_seen(self, chat_id: int) -> int:
         if not self._db:
@@ -1492,7 +1674,14 @@ class ChatBotModule(yarp.RFModule):
         turn_count = int(row[2] or 0)
         return summary, history, turn_count
 
-    def _db_save_memory(self, chat_id: int, summary: str, history: List[Dict[str, str]], turn_count: int) -> None:
+    def _db_save_memory(
+        self,
+        chat_id: int,
+        summary: str,
+        history: List[Dict[str, str]],
+        turn_count: int,
+        commit: bool = True,
+    ) -> None:
         if not self._db:
             return
         now = int(time.time())
@@ -1507,13 +1696,15 @@ class ChatBotModule(yarp.RFModule):
             "turn_count=excluded.turn_count, updated_at=excluded.updated_at",
             (int(chat_id), summary or "", json.dumps(trimmed, ensure_ascii=False), int(turn_count), now),
         )
-        self._db.commit()
+        if commit:
+            self._db_commit()
 
-    def _db_clear_memory(self, chat_id: int) -> None:
+    def _db_clear_memory(self, chat_id: int, commit: bool = True) -> None:
         if not self._db:
             return
         self._db.execute("DELETE FROM chat_memory WHERE chat_id=?", (int(chat_id),))
-        self._db.commit()
+        if commit:
+            self._db_commit()
 
     # ------------------------- Misc helpers -------------------------
     @staticmethod

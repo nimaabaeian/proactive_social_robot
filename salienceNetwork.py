@@ -89,9 +89,9 @@ class SalienceNetworkModule(yarp.RFModule):
 
     # Minimum IPS by social state
     SS_THRESHOLDS = {
-        "ss1": 1.0,  # Stranger: standard hurdle
-        "ss2": 0.8,  # Friend (ungreeted): eager to initiate
-        "ss3": 1.2,  # Friend (greeted): needs strong intent to bother again
+        "ss1": 1.10,  # Stranger: stricter hurdle (less proactive)
+        "ss2": 0.90,  # Known, not greeted: more proactive
+        "ss3": 1.00,  # Known, greeted, no talk: still proactive, but less than ss2
         "ss4": 99.0,  # Ultimate: never proactive
     }
 
@@ -1827,39 +1827,51 @@ class SalienceNetworkModule(yarp.RFModule):
                 "CREATE INDEX IF NOT EXISTS idx_learning_changes_person ON learning_changes(person_id)"
             )
 
-            self._ensure_learning_changes_columns(conn)
+            self._create_analytics_views(conn)
             conn.commit()
             conn.close()
             self._log("INFO", f"DB ready: {self.db_path}")
         except Exception as e:
             self._log("ERROR", f"DB init failed: {e}")
 
-    def _ensure_learning_changes_columns(self, conn: sqlite3.Connection):
-        """Add missing learning_changes columns for existing DBs."""
-        try:
-            rows = conn.execute("PRAGMA table_info(learning_changes)").fetchall()
-            existing = {r[1] for r in rows}
-            required = {
-                "outcome": "TEXT",
-                "reason": "TEXT",
-                "success": "INTEGER",
-                "abort_reason": "TEXT",
-                "name_extracted": "INTEGER",
-                "exec_interaction_id": "TEXT",
-                "old_prox": "REAL",
-                "old_cent": "REAL",
-                "old_vel": "REAL",
-                "old_gaze": "REAL",
-                "new_prox": "REAL",
-                "new_cent": "REAL",
-                "new_vel": "REAL",
-                "new_gaze": "REAL",
-            }
-            for col, typ in required.items():
-                if col not in existing:
-                    conn.execute(f"ALTER TABLE learning_changes ADD COLUMN {col} {typ}")
-        except Exception as e:
-            self._log("WARNING", f"learning_changes migration skipped: {e}")
+    def _create_analytics_views(self, conn: sqlite3.Connection):
+        c = conn.cursor()
+        c.execute("DROP VIEW IF EXISTS v_interaction_attempts_clean")
+        c.execute(
+            """
+            CREATE VIEW v_interaction_attempts_clean AS
+            SELECT
+                attempt_id,
+                timestamp,
+                substr(timestamp, 1, 10) AS day_rome,
+                track_id,
+                face_id,
+                person_id,
+                start_ss,
+                CAST(success AS INTEGER) AS success,
+                final_state,
+                abort_reason,
+                exec_interaction_id,
+                duration_sec
+            FROM interaction_attempts
+            WHERE start_ss IN ('ss1', 'ss2', 'ss3')
+            """
+        )
+
+        c.execute("DROP VIEW IF EXISTS v_interaction_attempts_daily")
+        c.execute(
+            """
+            CREATE VIEW v_interaction_attempts_daily AS
+            SELECT
+                day_rome,
+                COUNT(*) AS launched,
+                SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS completed,
+                SUM(CASE WHEN final_state = 'ss4' THEN 1 ELSE 0 END) AS reached_ss4,
+                AVG(duration_sec) AS avg_duration_sec
+            FROM v_interaction_attempts_clean
+            GROUP BY day_rome
+            """
+        )
 
     def _db_log(self, table: str, data: Dict):
         data["timestamp"] = datetime.now(self.TIMEZONE).isoformat()

@@ -14,6 +14,7 @@ import unicodedata
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -293,6 +294,7 @@ class ExecutiveControlModule(yarp.RFModule):
     LLM_ASYNC_NAME_WAIT_SEC = 1.0
     LLM_ASYNC_POLL_SEC = 0.05
     DB_QUEUE_MAXSIZE = 512
+    TIMEZONE = ZoneInfo("Europe/Rome")
 
     # ==================== Lifecycle ====================
 
@@ -720,6 +722,7 @@ class ExecutiveControlModule(yarp.RFModule):
                     "abort_reason": compact_abort_reason,
                     "initial_state": social_state,
                     "final_state": result.get("final_state", social_state),
+                    "replied_any": bool(result.get("replied_any", False)),
                 }
 
                 if result.get("extracted_name"):
@@ -789,6 +792,7 @@ class ExecutiveControlModule(yarp.RFModule):
             "final_state": social_state,
             "greeted": False,
             "talked": False,
+            "replied_any": False,
             "extracted_name": None,
             "abort_reason": None,
             "target_stayed_biggest": True,
@@ -948,6 +952,7 @@ class ExecutiveControlModule(yarp.RFModule):
                 result.get("abort_reason") or "no_response_greeting"
             )
             return
+        result["replied_any"] = True
 
         self._log("INFO", f"SS1: response: '{utterance}'")
         if self._check_abort(result):
@@ -1046,6 +1051,7 @@ class ExecutiveControlModule(yarp.RFModule):
 
             utterance = self._wait_user_utterance_abortable(self.SS2_GREET_TIMEOUT)
             if utterance:
+                result["replied_any"] = True
                 self._log("INFO", f"SS2: response: '{utterance}'")
                 threading.Thread(
                     target=self._write_last_greeted,
@@ -1084,10 +1090,21 @@ class ExecutiveControlModule(yarp.RFModule):
             return None
 
         try:
-            conn = sqlite3.connect(db_path, timeout=5.0)
-            conn.execute("PRAGMA journal_mode=WAL")
-            rows = conn.execute("SELECT chat_id, data_json FROM user_memory").fetchall()
-            conn.close()
+            db_uri = f"file:{db_path}?mode=ro"
+            conn = sqlite3.connect(db_uri, uri=True, timeout=5.0)
+            try:
+                conn.execute("PRAGMA query_only=ON")
+                rows = conn.execute(
+                    "SELECT chat_id, data_json FROM user_memory"
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.OperationalError as e:
+            if "no such table" in str(e).lower():
+                self._log("DEBUG", f"Telegram DB missing user_memory table: {db_path}")
+                return None
+            self._log("WARNING", f"Telegram DB read failed: {e}")
+            return None
         except Exception as e:
             self._log("WARNING", f"Telegram DB read failed: {e}")
             return None
@@ -1280,6 +1297,7 @@ class ExecutiveControlModule(yarp.RFModule):
 
             turns += 1
             user_responded = True
+            result["replied_any"] = True
             self._log("INFO", f"SS3 turn {turns}: '{utterance}'")
 
             if self._check_abort(result):
@@ -2400,8 +2418,16 @@ class ExecutiveControlModule(yarp.RFModule):
                 initial_state TEXT, final_state TEXT,
                 success INTEGER, abort_reason TEXT,
                 greeted INTEGER, talked INTEGER,
+                replied_any INTEGER,
                 extracted_name TEXT,
                 target_stayed_biggest INTEGER,
+                interaction_tag TEXT,
+                hunger_state_start TEXT,
+                hunger_state_end TEXT,
+                stomach_level_start REAL,
+                stomach_level_end REAL,
+                meals_eaten_count INTEGER,
+                last_meal_payload TEXT,
                 transcript TEXT,
                 full_result TEXT
             )""")
@@ -2424,13 +2450,148 @@ class ExecutiveControlModule(yarp.RFModule):
                 "CREATE INDEX IF NOT EXISTS idx_interactions_interaction_id ON interactions(interaction_id)"
             )
             c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_interactions_state_success ON interactions(initial_state, final_state, success)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_interactions_hunger_start ON interactions(hunger_state_start)"
+            )
+            c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_responsive_time ON responsive_interactions(timestamp)"
             )
+
+            self._create_analytics_views(conn)
             conn.commit()
             conn.close()
             self._log("INFO", f"DB ready: {self.DB_FILE}")
         except Exception as e:
             self._log("ERROR", f"DB init failed: {e}")
+
+    def _create_analytics_views(self, conn: sqlite3.Connection):
+        c = conn.cursor()
+
+        c.execute("DROP VIEW IF EXISTS v_proactive_interactions")
+        c.execute(
+            """
+            CREATE VIEW v_proactive_interactions AS
+            SELECT
+                interaction_id,
+                timestamp,
+                substr(timestamp, 1, 10) AS day_rome,
+                track_id,
+                face_id,
+                COALESCE(NULLIF(extracted_name, ''), face_id) AS user_key,
+                initial_state,
+                final_state,
+                CAST(success AS INTEGER) AS success,
+                CAST(greeted AS INTEGER) AS greeted,
+                CAST(talked AS INTEGER) AS talked,
+                CAST(COALESCE(replied_any, 0) AS INTEGER) AS replied_any,
+                abort_reason,
+                interaction_tag,
+                hunger_state_start,
+                hunger_state_end,
+                stomach_level_start,
+                stomach_level_end,
+                meals_eaten_count,
+                last_meal_payload
+            FROM interactions
+            WHERE initial_state IN ('ss1', 'ss2', 'ss3')
+            """
+        )
+
+        c.execute("DROP VIEW IF EXISTS v_metric_ss3_to_ss4_daily")
+        c.execute(
+            """
+            CREATE VIEW v_metric_ss3_to_ss4_daily AS
+            SELECT
+                day_rome,
+                hunger_state_start,
+                COUNT(*) AS launched_ss3,
+                SUM(CASE WHEN success = 1 AND final_state = 'ss4' THEN 1 ELSE 0 END) AS reached_ss4,
+                CASE
+                    WHEN COUNT(*) = 0 THEN 0.0
+                    ELSE 1.0 * SUM(CASE WHEN success = 1 AND final_state = 'ss4' THEN 1 ELSE 0 END) / COUNT(*)
+                END AS probability_ss3_to_ss4
+            FROM v_proactive_interactions
+            WHERE initial_state = 'ss3'
+            GROUP BY day_rome, hunger_state_start
+            """
+        )
+
+        c.execute("DROP VIEW IF EXISTS v_metric_daily_interactions_completed")
+        c.execute(
+            """
+            CREATE VIEW v_metric_daily_interactions_completed AS
+            SELECT
+                day_rome,
+                hunger_state_start,
+                COUNT(*) AS completed_interactions
+            FROM v_proactive_interactions
+            WHERE success = 1
+            GROUP BY day_rome, hunger_state_start
+            """
+        )
+
+        c.execute("DROP VIEW IF EXISTS v_metric_proactive_response_rate_daily")
+        c.execute(
+            """
+            CREATE VIEW v_metric_proactive_response_rate_daily AS
+            SELECT
+                day_rome,
+                hunger_state_start,
+                COUNT(*) AS proactive_launches,
+                SUM(CASE WHEN replied_any = 1 THEN 1 ELSE 0 END) AS replied_count,
+                CASE
+                    WHEN COUNT(*) = 0 THEN 0.0
+                    ELSE 1.0 * SUM(CASE WHEN replied_any = 1 THEN 1 ELSE 0 END) / COUNT(*)
+                END AS proactive_response_rate
+            FROM v_proactive_interactions
+            GROUP BY day_rome, hunger_state_start
+            """
+        )
+
+        c.execute("DROP VIEW IF EXISTS v_metric_repeat_users_daily")
+        c.execute(
+            """
+            CREATE VIEW v_metric_repeat_users_daily AS
+            WITH per_user AS (
+                SELECT
+                    day_rome,
+                    hunger_state_start,
+                    user_key,
+                    COUNT(*) AS completed_count
+                FROM v_proactive_interactions
+                WHERE success = 1
+                GROUP BY day_rome, hunger_state_start, user_key
+            )
+            SELECT
+                day_rome,
+                hunger_state_start,
+                SUM(CASE WHEN completed_count > 1 THEN 1 ELSE 0 END) AS repeat_users,
+                COUNT(*) AS distinct_users_with_completion
+            FROM per_user
+            GROUP BY day_rome, hunger_state_start
+            """
+        )
+
+        c.execute("DROP VIEW IF EXISTS v_metric_ss1ss2_to_ss4_daily")
+        c.execute(
+            """
+            CREATE VIEW v_metric_ss1ss2_to_ss4_daily AS
+            SELECT
+                day_rome,
+                hunger_state_start,
+                COUNT(*) AS launched_ss1_ss2,
+                SUM(CASE WHEN success = 1 AND final_state = 'ss4' THEN 1 ELSE 0 END) AS reached_ss4,
+                CASE
+                    WHEN COUNT(*) = 0 THEN 0.0
+                    ELSE 1.0 * SUM(CASE WHEN success = 1 AND final_state = 'ss4' THEN 1 ELSE 0 END) / COUNT(*)
+                END AS progression_ss1ss2_to_ss4
+            FROM v_proactive_interactions
+            WHERE initial_state IN ('ss1', 'ss2')
+            GROUP BY day_rome, hunger_state_start
+            """
+        )
 
     def _open_db_connection(self, timeout: float) -> sqlite3.Connection:
         conn = sqlite3.connect(self.DB_FILE, timeout=timeout)
@@ -2476,23 +2637,33 @@ class ExecutiveControlModule(yarp.RFModule):
         try:
             r = data["result"]
             c = conn.cursor()
+            raw_logs = r.get("logs", [])
+
             # Build transcript from logs
             transcript_lines = [
                 log["message"]
-                for log in r.get("logs", [])
+                for log in raw_logs
                 if "User:" in log.get("message", "")
                 or "Robot:" in log.get("message", "")
                 or "Asking" in log.get("message", "")
                 or "Response" in log.get("message", "")
             ]
+
+            # Keep payload compact and non-redundant: transcript already stores
+            # conversational traces, so avoid persisting full logs twice.
+            result_compact = dict(r)
+            result_compact.pop("logs", None)
+
             c.execute(
                 """INSERT INTO interactions
                 (interaction_id,timestamp,track_id,face_id,initial_state,final_state,success,abort_reason,
-                 greeted,talked,extracted_name,target_stayed_biggest,transcript,full_result)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 greeted,talked,replied_any,extracted_name,target_stayed_biggest,
+                 interaction_tag,hunger_state_start,hunger_state_end,stomach_level_start,stomach_level_end,
+                 meals_eaten_count,last_meal_payload,transcript,full_result)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     data.get("interaction_id"),
-                    datetime.now().isoformat(),
+                    datetime.now(self.TIMEZONE).isoformat(),
                     data["track_id"],
                     data["face_id"],
                     data["initial_state"],
@@ -2501,10 +2672,18 @@ class ExecutiveControlModule(yarp.RFModule):
                     r.get("abort_reason"),
                     int(r.get("greeted", False)),
                     int(r.get("talked", False)),
+                    int(r.get("replied_any", False)),
                     r.get("extracted_name"),
                     int(r.get("target_stayed_biggest", True)),
+                    r.get("interaction_tag"),
+                    r.get("hunger_state_start"),
+                    r.get("hunger_state_end"),
+                    r.get("stomach_level_start"),
+                    r.get("stomach_level_end"),
+                    r.get("meals_eaten_count"),
+                    r.get("last_meal_payload"),
                     json.dumps(transcript_lines, ensure_ascii=False),
-                    json.dumps(r, ensure_ascii=False),
+                    json.dumps(result_compact, ensure_ascii=False),
                 ),
             )
             conn.commit()
