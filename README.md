@@ -4,14 +4,14 @@
 > **Platform:** YARP
 > **Author:** Nima Abaeian
 
-Architecture reference for the always-on proactive social robot system.
-Covers perception, selection, interaction, and relationship layers end-to-end.
+Technical reference for the always-on proactive social robot Cognitive Architecture.
+Covers perception, selection, interaction, and long-term relationship layers end-to-end.
 
 ---
 
 ## 1) Big Picture
 
-Four always-running layers, each with a distinct responsibility:
+Four continuously running layers, each with a distinct responsibility:
 
 | Layer | Module | Role |
 |---|---|---|
@@ -56,7 +56,7 @@ Four always-running layers, each with a distinct responsibility:
 
 Supporting utilities:
 
-- `generateQr.py` — generates `SMALL_MEAL`, `MEDIUM_MEAL`, `LARGE_MEAL` QR PNGs
+- `generateQr.py` — generates `SMALL_MEAL`, `MEDIUM_MEAL`, and `LARGE_MEAL` QR PNGs
 - `mockPublisher.py` — synthetic STM context and hunger stream for integration testing
 
 ---
@@ -95,7 +95,7 @@ Supporting utilities:
   -> broadcasts HS3 starvation alerts to subscribers
 ```
 
-### Fast mental model
+### Conceptual model
 
 ```text
 Perception (high rate) → Selection gate → Interaction transaction → Memory update
@@ -110,7 +110,7 @@ Perception (high rate) → Selection gate → Interaction transaction → Memory
 
 ### What it does
 
-Reads the camera stream and produces per-face rich descriptors that downstream modules consume.
+Processes the camera stream and publishes high-fidelity per-face descriptors for downstream modules.
 
 - **YOLO face detection** — detects faces with confidence threshold, expands bounding boxes by 10% for better face crops
 - **ByteTrack** — maintains stable `track_id` across frames, even through brief occlusions
@@ -249,8 +249,8 @@ This gradually releases gaze lock toward a more novel face.
 **Step 5 — Eligibility thresholds by social state**
 
 ```text
-ss1 (unknown)            IPS >= 1.10  (stricter hurdle)
-ss2 (known, ungreeted)   IPS >= 0.90  (most proactive)
+ss1 (unknown)            IPS >= 1.10  (stricter threshold)
+ss2 (known, ungreeted)   IPS >= 0.90  (lowest proactive threshold)
 ss3 (greeted, no talk)   IPS >= 1.00  (still proactive, less than ss2)
 ss4 (fully talked)       IPS >= 99.0  (never proactively triggered)
 ```
@@ -333,7 +333,7 @@ STM missing               → default cooldown (5 s)
 ```text
 run(track_id, face_id, ss)
   |
-  +--> ss4?  → no-op success, return immediately
+  +--> ss4?  → no-operation success, return immediately
   |
   +--> resolve face_id (wait up to 5 s if still "recognizing")
   |
@@ -386,7 +386,7 @@ run(track_id, face_id, ss)
 
 **SS4 — Already fully interacted today**
 ```text
-No-op. Returns success immediately.
+No operation. Returns success immediately.
 ```
 
 ### Hunger subsystem
@@ -416,10 +416,10 @@ mode switch always resets stored level to 100%
 ```text
 1. Ask for food ("I'm hungry, would you feed me?")
 2. Wait for a QR scan (up to feed_wait_timeout_sec)
-3. QR received  → apply meal delta, "Yummy, thank you"
+3. QR received  → apply meal delta, then acknowledge feed
                 → if still hungry → ask for more
                 → if HS1 reached  → done
-4. No QR        → "Look around for food" (prompt #1)
+4. No QR        → prompt user to look for food (prompt #1)
 5. Second miss  → abort (no_food_qr)
 ```
 
@@ -526,7 +526,7 @@ While remaining HS3:
   → periodic re-broadcast per subscriber (cooldown: 30 min each)
   → skip users who chatted within the last 10 min (don't spam active users)
 
-Broadcast message is LLM-generated; falls back to prompt template on failure.
+Broadcast message is LLM-generated, with a prompt-template fallback on failure.
 ```
 
 ### Conversation memory model
@@ -566,9 +566,9 @@ Additionally, Telegram metadata (sender name from `from.first_name`) is used to 
 |---|---|
 | `status` | Returns effective hunger state (`HS0/HS1/HS2/HS3`), subscriber count, queue size, thread health |
 | `set_hs HS1\|HS2\|HS3` | Manual override of effective hunger state (bypasses stale protection) |
-| `reload_prompts` | Hot-reload `prompts.json` without restart |
+| `reload_prompts` | Reload `prompts.json` without restart |
 
-**Stale hunger protection:** if no hunger update arrives for 60 s and no manual override is active, effective state falls back to HS0 (hunger drive unavailable) to avoid injecting stale hunger behavior.
+**Stale hunger protection:** if no hunger update arrives for 60 s and no manual override is active, effective state falls back to HS0 (hunger drive unavailable) to prevent stale hunger behavior.
 
 ---
 
@@ -596,7 +596,7 @@ Run with `--verify` to decode and validate generated QR codes.
 
 ## 3.7 `prompts.json` — Prompt Surface
 
-Central prompt file loaded by both `executiveControl` and `chatBot` at startup and hot-reloadable.
+Central prompt file loaded by both `executiveControl` and `chatBot` at startup, with runtime reload support.
 
 **`executiveControl` section:**
 - `system_default`, `system_json` — base LLM system prompts
@@ -791,9 +791,9 @@ yarp connect /alwayson/stm/context:o /alwayson/salienceNetwork/context:i
 | `executiveControl` | `hunger <hs1\|hs2\|hs3>` | Manually set stomach level |
 | `executiveControl` | `hunger_mode <on\|off>` | Enable/disable hunger logic globally (resets level to 100%) |
 | `executiveControl` | `status`, `ping`, `help`, `quit` | Module control |
-| `chatBot` | `status` | Returns hunger state, subscribers, thread health |
+| `chatBot` | `status` | Returns hunger state, subscriber count, and thread health |
 | `chatBot` | `set_hs HS1\|HS2\|HS3` | Override effective hunger persona |
-| `chatBot` | `reload_prompts` | Hot-reload prompts.json |
+| `chatBot` | `reload_prompts` | Reload prompts.json without restart |
 
 ---
 
@@ -917,7 +917,7 @@ chatBot.py
 
 - Proactive and responsive execution paths are mutually exclusive — responsive events are dropped (not deferred) while a proactive interaction runs.
 - `salienceNetwork` starts and runs without STM context connected — the context port is optional and can be connected at any time.
-- `chatBot` is safe against disconnected `executiveControl` — stale hunger falls back to HS0 after 60 s.
+- `chatBot` remains resilient if `executiveControl` disconnects — stale hunger falls back to HS0 after 60 s.
 - `executiveControl` can run with hunger mode OFF — interactions proceed as hunger-neutral (`HS1`/100%), and QR feeding events are ignored.
 - All LLM calls have fallback strings — no interaction or Telegram reply ever blocks indefinitely on LLM availability.
 - All file I/O and DB writes are off the main loop — latency spikes in storage never stall perception or interaction.
