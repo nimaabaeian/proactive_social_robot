@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import queue
+import signal
 import sqlite3
 from dataclasses import asdict, dataclass
 import sys
@@ -96,7 +97,7 @@ class SalienceNetworkModule(yarp.RFModule):
     }
 
     IPS_HYSTERESIS_BONUS = 0.3  # Stickiness for the current target
-    HABITUATION_LAMBDA = 0.05  # Habituation decay
+    HABITUATION_LAMBDA = 0.10  # Habituation decay
     WEIGHT_SHIFT_RATE = 0.15  # How much weights drift per interaction (+/-)
     TARGET_LOG_MIN_PERIOD_SEC = 1.0
     TARGET_LOG_IPS_DELTA = 0.15
@@ -144,6 +145,7 @@ class SalienceNetworkModule(yarp.RFModule):
         self.debug_port: Optional[yarp.Port] = None
         self.vision_cmd_port: Optional[yarp.BufferedPortBottle] = None
         self.executive_control_rpc: Optional[yarp.RpcClient] = None
+        self._exec_rpc_local_name: str = ""
         self.facetracker_rpc: Optional[yarp.RpcClient] = None
         self.stm_context_port: Optional[yarp.BufferedPortBottle] = None
 
@@ -155,12 +157,14 @@ class SalienceNetworkModule(yarp.RFModule):
         self.state_lock = threading.Lock()
         self.current_faces: List[Dict[str, Any]] = []
         self.selected_target: Optional[Dict[str, Any]] = None
-        self.selected_bbox_last: Optional[Tuple[float, float, float, float]] = None
         self.interaction_busy = False
         self.interaction_thread: Optional[threading.Thread] = None
 
         self.area_history: Dict[int, float] = {}  # Maps track_id to previous bbox area
         self.current_target_track_id: int = -1  # For applying Hysteresis
+        self._target_decay_track_id: int = -1
+        self._target_decay_started_at: float = 0.0
+        self._decay_caps: Dict[int, float] = {}
 
         # Guards memory dicts and file I/O
         self._memory_lock = threading.Lock()
@@ -174,13 +178,12 @@ class SalienceNetworkModule(yarp.RFModule):
         self.cooldown_default: float = 5.0
         self.min_track_ips: float = 0.9
         self.track_stop_hysteresis: float = 0.1
+        self.track_switch_hysteresis: float = 0.05
         self.track_stop_debounce_sec: float = 2.0
-        self._below_track_threshold_since: float = 0.0
         self.exec_rpc_retry_sec: float = 1.0
+        self.unknown_ss1_wait_sec: float = 5.0
 
         self.current_context_label: int = -1
-        self.frame_skip_counter = 0
-        self.frame_skip_rate = 0
 
         # Cache recent landmarks for sparse upstream publishing.
         self._latest_landmarks: List[Dict[str, Any]] = []
@@ -200,8 +203,6 @@ class SalienceNetworkModule(yarp.RFModule):
         self.verbose_debug = False
         self.ports_connected_logged = False
         self.status_log_period_sec: float = 1.0
-        self._last_status_log_ts: float = 0.0
-        self._last_status_line: str = ""
         self._last_target_key: Tuple[int, str, str] = (-2, "", "")
         self._last_sent_track_id: int = -99999
         self._last_sent_ips: float = -1.0
@@ -214,10 +215,6 @@ class SalienceNetworkModule(yarp.RFModule):
         self._last_target_log_ips: float = -1.0
         self._last_target_log_ts: float = 0.0
 
-        self.DISAPPEAR_WINDOW_SEC = 30.0
-        self.DISAPPEAR_THRESHOLD = 2
-        self._disappear_events: Dict[str, List[float]] = {}
-
         self._io_queue: queue.Queue = queue.Queue(maxsize=self.IO_QUEUE_MAXSIZE)
         self._io_thread: Optional[threading.Thread] = None
 
@@ -225,6 +222,7 @@ class SalienceNetworkModule(yarp.RFModule):
         self._db_queue: queue.Queue = queue.Queue(maxsize=self.DB_QUEUE_MAXSIZE)
         self._db_thread: Optional[threading.Thread] = None
         self._context_connected_logged = False
+        self._unknown_ss1_since: Dict[int, float] = {}
 
     # ------------------------------------------------------------------ configure
     def configure(self, rf: yarp.ResourceFinder) -> bool:
@@ -262,6 +260,10 @@ class SalienceNetworkModule(yarp.RFModule):
                 self.track_stop_hysteresis = max(
                     0.0, rf.find("track_stop_hysteresis").asFloat64()
                 )
+            if rf.check("track_switch_hysteresis"):
+                self.track_switch_hysteresis = max(
+                    0.0, rf.find("track_switch_hysteresis").asFloat64()
+                )
             if rf.check("track_stop_debounce_sec"):
                 self.track_stop_debounce_sec = max(
                     0.0, rf.find("track_stop_debounce_sec").asFloat64()
@@ -274,12 +276,22 @@ class SalienceNetworkModule(yarp.RFModule):
                 self.exec_rpc_retry_sec = max(
                     0.1, rf.find("exec_rpc_retry_sec").asFloat64()
                 )
+            if rf.check("unknown_ss1_wait_sec"):
+                self.unknown_ss1_wait_sec = max(
+                    0.0, rf.find("unknown_ss1_wait_sec").asFloat64()
+                )
 
             # --- Open ports ---
             def _open_port(attr: str, cls, name: str) -> bool:
                 port = cls()
                 next_log_ts = 0.0
                 while not port.open(name):
+                    if not self._running:
+                        try:
+                            port.close()
+                        except Exception:
+                            pass
+                        return False
                     now = time.time()
                     if now >= next_log_ts:
                         self._log("INFO", f"Waiting local port availability: {name}")
@@ -314,6 +326,8 @@ class SalienceNetworkModule(yarp.RFModule):
             handle_name = f"/{self.module_name}"
             handle_next_log_ts = 0.0
             while not self.handle_port.open(handle_name):
+                if not self._running:
+                    return False
                 now = time.time()
                 if now >= handle_next_log_ts:
                     self._log("INFO", f"Waiting local port availability: {handle_name}")
@@ -324,6 +338,12 @@ class SalienceNetworkModule(yarp.RFModule):
             _ctx_local = f"/alwayson/{self.module_name}/context:i"
             ctx_next_log_ts = 0.0
             while not self.stm_context_port.open(_ctx_local):
+                if not self._running:
+                    try:
+                        self.stm_context_port.close()
+                    except Exception:
+                        pass
+                    return False
                 now = time.time()
                 if now >= ctx_next_log_ts:
                     self._log("INFO", f"Waiting local port availability: {_ctx_local}")
@@ -332,6 +352,7 @@ class SalienceNetworkModule(yarp.RFModule):
 
             self.executive_control_rpc = yarp.RpcClient()
             exec_rpc_local = f"/{self.module_name}/executiveControl:rpc"
+            self._exec_rpc_local_name = exec_rpc_local
             if not self.executive_control_rpc.open(exec_rpc_local):
                 self._log("ERROR", f"Failed to open port: {exec_rpc_local}")
                 return False
@@ -436,6 +457,10 @@ class SalienceNetworkModule(yarp.RFModule):
 
     def close(self) -> bool:
         self._log("INFO", "Closing...")
+        if self.executive_control_rpc:
+            self.executive_control_rpc.interrupt()
+        if self.facetracker_rpc:
+            self.facetracker_rpc.interrupt()
         if self.interaction_thread and self.interaction_thread.is_alive():
             self.interaction_thread.join(timeout=5.0)
         self._enqueue_save("greeted")
@@ -447,15 +472,17 @@ class SalienceNetworkModule(yarp.RFModule):
         self._queue_put_drop_oldest(self._db_queue, None, "DB queue close")
         if self._db_thread:
             self._db_thread.join(timeout=3.0)
-        if self.facetracker_rpc:
+        if self.facetracker_rpc and self._running:
             # Send 'sus' before shutting down, only try once so we don't delay close()
             self._send_facetracker_cmd("sus", retries=1)
+        if self.executive_control_rpc:
+            self.executive_control_rpc.close()
+        if self.facetracker_rpc:
             self.facetracker_rpc.close()
 
         for port in [
             self.landmarks_port,
             self.debug_port,
-            self.executive_control_rpc,
             self.vision_cmd_port,
             self.stm_context_port,
             self.handle_port,
@@ -593,101 +620,11 @@ class SalienceNetworkModule(yarp.RFModule):
                     # - while interaction_busy, target lock follows selected track when visible.
 
                     # --- A. ATTENTION LAYER (Who to look at) ---
-                    best_face = self._select_best_face(self.current_faces)
-
-                    # RPC override: executiveControl can force gaze via set_track_id
                     override_tid = self.rpc_override_track_id
-                    if override_tid >= 0:
-                        override_face = next(
-                            (
-                                f
-                                for f in self.current_faces
-                                if f.get("track_id") == override_tid
-                            ),
-                            None,
-                        )
-                        if override_face is not None:
-                            target_to_look_at = override_face
-                        else:
-                            target_to_look_at = {
-                                "track_id": override_tid,
-                                "ips": 0.0,
-                            }
-                    elif self.interaction_busy and self.selected_target:
-                        active_track_id = self.selected_target.get("track_id")
-                        active_face = next(
-                            (
-                                f
-                                for f in self.current_faces
-                                if f.get("track_id") == active_track_id
-                            ),
-                            None,
-                        )
-                        if active_face is not None:
-                            self.selected_target = active_face
-                            target_to_look_at = active_face
-                        else:
-                            target_to_look_at = dict(self.selected_target)
-                    else:
-                        target_to_look_at = best_face
-
-                    should_track = False
-                    now_track = time.time()
-                    current_sent_track_id = self._last_sent_track_id
-                    if target_to_look_at is not None:
-                        if override_tid >= 0:
-                            self._below_track_threshold_since = 0.0
-                            should_track = True
-                        elif self.interaction_busy:
-                            self._below_track_threshold_since = 0.0
-                            should_track = True
-                        else:
-                            target_track_id = int(target_to_look_at.get("track_id", -1))
-                            target_ips = float(target_to_look_at.get("ips", 0.0))
-                            same_as_current = (
-                                current_sent_track_id >= 0
-                                and target_track_id == current_sent_track_id
-                            )
-                            stop_threshold = max(
-                                0.0, self.min_track_ips - self.track_stop_hysteresis
-                            )
-                            threshold = (
-                                stop_threshold if same_as_current else self.min_track_ips
-                            )
-                            if target_ips >= threshold:
-                                self._below_track_threshold_since = 0.0
-                                should_track = True
-                            elif same_as_current and self.track_stop_debounce_sec > 0.0:
-                                if self._below_track_threshold_since <= 0.0:
-                                    self._below_track_threshold_since = now_track
-                                should_track = (
-                                    (now_track - self._below_track_threshold_since)
-                                    < self.track_stop_debounce_sec
-                                )
-                            else:
-                                self._below_track_threshold_since = 0.0
-                                should_track = False
-                    else:
-                        # If target briefly vanishes, debounce stop while holding last track.
-                        if (
-                            current_sent_track_id >= 0
-                            and self.track_stop_debounce_sec > 0.0
-                        ):
-                            if self._below_track_threshold_since <= 0.0:
-                                self._below_track_threshold_since = now_track
-                            should_track = (
-                                (now_track - self._below_track_threshold_since)
-                                < self.track_stop_debounce_sec
-                            )
-                            if should_track:
-                                target_to_look_at = {
-                                    "track_id": current_sent_track_id,
-                                    "ips": float(self._last_sent_ips),
-                                }
-                        else:
-                            self._below_track_threshold_since = 0.0
-
-                    command_target = target_to_look_at if should_track else None
+                    target_to_look_at = self._choose_attention_target(
+                        self.current_faces, override_tid
+                    )
+                    command_target = self._hydrate_tracking_target(target_to_look_at)
 
                     # Send I/O outside locks.
                     command_target_for_io = (
@@ -708,9 +645,7 @@ class SalienceNetworkModule(yarp.RFModule):
                         track_id = candidate.get("track_id", -1)
                         person_id = candidate.get("person_id", face_id)
 
-                        resolved = self._is_face_id_resolved(face_id)
-
-                        if resolved:
+                        if self._can_attempt_interaction(candidate, current_time):
                             exec_face_id = (
                                 str(person_id)
                                 if self._is_face_known(str(person_id))
@@ -757,10 +692,7 @@ class SalienceNetworkModule(yarp.RFModule):
 
                                     if current_time < self._next_exec_rpc_try_ts:
                                         can_try_exec = False
-                                    elif (
-                                        self.executive_control_rpc is None
-                                        or self.executive_control_rpc.getOutputCount() == 0
-                                    ):
+                                    elif not self._ensure_exec_rpc_connected(log_on_fail=False):
                                         self._next_exec_rpc_try_ts = current_time + self.exec_rpc_retry_sec
                                         if not self._exec_rpc_offline_logged:
                                             self._log("INFO", "exec: offline, skip")
@@ -782,8 +714,17 @@ class SalienceNetworkModule(yarp.RFModule):
             self._log_status_tick(command_target_for_io)
 
             if pending_exec_check is not None:
+                self._log(
+                    "INFO",
+                    (
+                        "try: start_check "
+                        f"t{pending_exec_check['track_id']} "
+                        f"{pending_exec_check['person_id']}"
+                    ),
+                )
                 im_status = self._executive_control_status()
                 if not isinstance(im_status, dict):
+                    self._log("INFO", "try: blocked status_unavailable")
                     self._next_exec_rpc_try_ts = current_time + self.exec_rpc_retry_sec
                 elif not im_status.get("busy", False):
                     with self._interaction_lock:
@@ -822,7 +763,6 @@ class SalienceNetworkModule(yarp.RFModule):
                                         candidate["exec_face_id"] = exec_face_id
 
                                         self.selected_target = candidate
-                                        self.selected_bbox_last = candidate["bbox"]
                                         self.interaction_busy = True
 
                                         ss = candidate.get("social_state", "ss1")
@@ -842,6 +782,33 @@ class SalienceNetworkModule(yarp.RFModule):
                                             daemon=True,
                                         )
                                         self.interaction_thread.start()
+                                    else:
+                                        self._log(
+                                            "INFO",
+                                            (
+                                                "try: blocked after_recheck "
+                                                f"cooldown_ok={now2 - last_int >= self._effective_cooldown()} "
+                                                f"eligible={bool(candidate.get('eligible', False))} "
+                                                f"ss={candidate.get('social_state', 'ss1')}"
+                                            ),
+                                        )
+                                else:
+                                    self._log(
+                                        "INFO",
+                                        f"try: blocked candidate_missing t{track_id}",
+                                    )
+                            else:
+                                self._log("INFO", "try: blocked salience_busy")
+                else:
+                    busy_mode = str(im_status.get("busy_mode", ""))
+                    busy_reason = str(im_status.get("busy_reason", ""))
+                    if busy_mode or busy_reason:
+                        self._log(
+                            "INFO",
+                            f"try: blocked executive_busy mode={busy_mode} reason={busy_reason}",
+                        )
+                    else:
+                        self._log("INFO", "try: blocked executive_busy")
 
 
 
@@ -877,7 +844,6 @@ class SalienceNetworkModule(yarp.RFModule):
 
         line = f"state: {busy} faces={face_count} look=t{target_tid} id={target_id} {target_ss} ips={ips:.2f}{override_str}"
         self._log("INFO", line)
-        self._last_status_line = line
         self._last_target_key = key
 
     def _should_log_target_selection(self, face: Dict[str, Any]) -> bool:
@@ -941,6 +907,22 @@ class SalienceNetworkModule(yarp.RFModule):
             face_data = self._parse_face_bottle(face_btl.asList())
             if face_data:
                 faces.append(face_data)
+
+        # Upstream multi-face association can transiently emit only unmatched faces
+        # for one frame. Do not replace a fresh valid tracked snapshot with an
+        # all-unmatched snapshot, or attention oscillates between target and none.
+        has_valid_tracks = any(int(f.get("track_id", -1)) >= 0 for f in faces)
+        prev_has_valid_tracks = any(
+            int(f.get("track_id", -1)) >= 0 for f in self._latest_landmarks
+        )
+        if (
+            faces
+            and not has_valid_tracks
+            and prev_has_valid_tracks
+            and self._latest_landmarks_ts > 0
+            and (time.time() - self._latest_landmarks_ts) <= self.landmarks_stale_sec
+        ):
+            return list(self._latest_landmarks)
 
         # Cache even empty parsed frames so real "no-face" observations can propagate.
         self._latest_landmarks = list(faces)
@@ -1049,7 +1031,7 @@ class SalienceNetworkModule(yarp.RFModule):
         # 1) no interaction is ongoing,
         # 2) there is more than one face visible.
         if (not self.interaction_busy) and len(faces) > 1:
-            current_track_id = self.current_target_track_id
+            current_track_id = self._active_attention_track_id()
             current_face = next(
                 (f for f in faces if int(f.get("track_id", -1)) == current_track_id),
                 None,
@@ -1062,6 +1044,22 @@ class SalienceNetworkModule(yarp.RFModule):
                 )
                 decay = self._habituation_multiplier(current_face, person_id)
                 current_face["ips"] = float(current_face.get("ips", 0.0)) * decay
+            else:
+                self._target_decay_track_id = -1
+                self._target_decay_started_at = 0.0
+        else:
+            self._target_decay_track_id = -1
+            self._target_decay_started_at = 0.0
+            self._decay_caps.clear()
+
+        active_track_id = self._active_attention_track_id()
+        for face in faces:
+            track_id = int(face.get("track_id", -1))
+            if track_id == active_track_id:
+                continue
+            cap = self._decay_caps.get(track_id)
+            if cap is not None:
+                face["ips"] = min(float(face.get("ips", 0.0)), float(cap))
 
         for face in faces:
             face["eligible"] = self._is_eligible(face)
@@ -1070,8 +1068,36 @@ class SalienceNetworkModule(yarp.RFModule):
         self.track_to_person = {
             t: p for t, p in self.track_to_person.items() if t in active
         }
+        self._unknown_ss1_since = {
+            t: ts for t, ts in self._unknown_ss1_since.items() if t in active
+        }
+        self._decay_caps = {
+            t: cap for t, cap in self._decay_caps.items() if t in active
+        }
         self.area_history = new_area_history
         return faces
+
+    def _can_attempt_interaction(self, face: Dict[str, Any], now_ts: float) -> bool:
+        """Gate interaction start to allow identity resolution for unresolved ss1 faces."""
+        track_id = int(face.get("track_id", -1))
+        social_state = str(face.get("social_state", "ss1"))
+        face_id = str(face.get("face_id", ""))
+
+        resolved = self._is_face_id_resolved(face_id)
+        if resolved or social_state != "ss1":
+            if track_id >= 0:
+                self._unknown_ss1_since.pop(track_id, None)
+            return True
+
+        if track_id < 0:
+            return False
+
+        first_seen = self._unknown_ss1_since.get(track_id)
+        if first_seen is None:
+            self._unknown_ss1_since[track_id] = now_ts
+            return False
+
+        return (now_ts - first_seen) >= self.unknown_ss1_wait_sec
 
     def _is_face_known(self, face_id: str) -> bool:
         if not face_id:
@@ -1176,6 +1202,7 @@ class SalienceNetworkModule(yarp.RFModule):
         """Calculates IPS using personal weights and optional Habituation Decay."""
         vars_norm = self._calculate_ips_variables(face)
         weights = self._get_person_weights(person_id)
+        active_track_id = self._active_attention_track_id()
 
         # Base Formula
         base_ips = (
@@ -1192,23 +1219,125 @@ class SalienceNetworkModule(yarp.RFModule):
         # Hysteresis Bonus
         if (
             face.get("track_id", -1) != -1
-            and face.get("track_id") == self.current_target_track_id
+            and face.get("track_id") == active_track_id
         ):
             ips += self.IPS_HYSTERESIS_BONUS
 
         return ips
 
     def _habituation_multiplier(self, face: Dict[str, Any], person_id: str) -> float:
-        """Compute habituation multiplier e^(-lambda * t_idle)."""
-        time_in_view = face.get("time_in_view", 0.0)
-        cd_key = self._cooldown_key(person_id, face.get("track_id", -1))
-        last_int_time = self.last_interaction_time.get(cd_key, 0)
+        """Decay only the continuously attended target during multi-face idle periods."""
+        track_id = int(face.get("track_id", -1))
+        if track_id < 0:
+            return 1.0
 
-        time_since_int = (
-            time.time() - last_int_time if last_int_time > 0 else float("inf")
+        now = time.time()
+        if self._target_decay_track_id != track_id:
+            self._target_decay_track_id = track_id
+            self._target_decay_started_at = now
+            return 1.0
+
+        elapsed = max(0.0, now - self._target_decay_started_at)
+        return math.exp(-self.HABITUATION_LAMBDA * elapsed)
+
+    def _active_attention_track_id(self) -> int:
+        """Return the track that is actually holding the robot's attention."""
+        if self.interaction_busy and self.selected_target is not None:
+            return int(self.selected_target.get("track_id", -1))
+        if self._last_sent_track_id >= 0:
+            return int(self._last_sent_track_id)
+        return int(self.current_target_track_id)
+
+    def _find_face_by_track_id(self, track_id: int) -> Optional[Dict[str, Any]]:
+        if track_id < 0:
+            return None
+        return next(
+            (f for f in self.current_faces if int(f.get("track_id", -1)) == track_id),
+            None,
         )
-        t_idle = min(time_in_view, time_since_int)
-        return math.exp(-self.HABITUATION_LAMBDA * t_idle)
+
+    def _hydrate_tracking_target(
+        self, target: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Prefer current full face state over synthetic track-only placeholders."""
+        if target is None:
+            return None
+
+        hydrated = dict(target)
+        track_id = int(hydrated.get("track_id", -1))
+        live_face = self._find_face_by_track_id(track_id)
+        if live_face is not None:
+            merged = dict(hydrated)
+            merged.update(live_face)
+            return merged
+
+        if (
+            track_id >= 0
+            and float(hydrated.get("ips", 0.0)) <= 0.0
+            and track_id == self._last_sent_track_id
+            and self._last_sent_ips > 0.0
+        ):
+            hydrated["ips"] = float(self._last_sent_ips)
+
+        return hydrated
+
+    def _visible_tracked_faces(self, faces: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [
+            f
+            for f in faces
+            if int(f.get("track_id", -1)) >= 0
+        ]
+
+    def _choose_attention_target(
+        self, faces: List[Dict[str, Any]], override_tid: int
+    ) -> Optional[Dict[str, Any]]:
+        """Simple tracking policy: decay current target, then track the highest visible IPS."""
+        if override_tid >= 0:
+            override_face = self._find_face_by_track_id(override_tid)
+            self.current_target_track_id = override_tid if override_face is not None else -1
+            return override_face if override_face is not None else {"track_id": override_tid, "ips": 0.0}
+
+        if self.interaction_busy and self.selected_target:
+            active_track_id = int(self.selected_target.get("track_id", -1))
+            active_face = self._find_face_by_track_id(active_track_id)
+            self.current_target_track_id = active_track_id if active_face is not None else -1
+            return active_face if active_face is not None else dict(self.selected_target)
+
+        visible_faces = self._visible_tracked_faces(faces)
+        if not visible_faces:
+            self.current_target_track_id = -1
+            return None
+
+        best_face = max(visible_faces, key=lambda f: float(f.get("ips", 0.0)))
+        active_track_id = self._active_attention_track_id()
+        active_face = self._find_face_by_track_id(active_track_id)
+        if active_face is not None:
+            active_ips = float(active_face.get("ips", 0.0))
+            best_ips = float(best_face.get("ips", 0.0))
+            best_track_id = int(best_face.get("track_id", -1))
+            if (
+                best_track_id != active_track_id
+                and len(visible_faces) > 1
+                and best_ips <= (active_ips + self.track_switch_hysteresis)
+            ):
+                self.current_target_track_id = active_track_id
+                return active_face
+
+            if best_track_id != active_track_id and len(visible_faces) > 1:
+                old_ips = float(active_face.get("ips", 0.0))
+                prev_cap = self._decay_caps.get(active_track_id)
+                self._decay_caps[active_track_id] = (
+                    old_ips if prev_cap is None else min(prev_cap, old_ips)
+                )
+            self.current_target_track_id = int(best_face.get("track_id", -1))
+            return best_face
+
+        if float(best_face.get("ips", 0.0)) < self.min_track_ips:
+            self.current_target_track_id = -1
+            return None
+
+        self.current_target_track_id = int(best_face.get("track_id", -1))
+        return best_face
 
     # ==================== Face Selection (Best IPS) ====================
 
@@ -1223,22 +1352,6 @@ class SalienceNetworkModule(yarp.RFModule):
     def _bbox_area(face: Dict[str, Any]) -> float:
         _, _, w, h = face.get("bbox", (0, 0, 0, 0))
         return w * h
-
-    def _select_best_face(
-        self, faces: List[Dict[str, Any]]
-    ) -> Optional[Dict[str, Any]]:
-        """Select face with highest IPS score."""
-        if not faces:
-            self.current_target_track_id = -1
-            return None
-
-        best = max(faces, key=lambda f: f.get("ips", 0.0))
-        if self._bbox_area(best) <= 0:
-            self.current_target_track_id = -1
-            return None
-
-        self.current_target_track_id = best.get("track_id", -1)
-        return best
 
     # ==================== Target Command Streaming ====================
 
@@ -1342,7 +1455,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 with self.state_lock:
                     self.interaction_busy = False
                     self.selected_target = None
-                    self.selected_bbox_last = None
                     final_id = str(
                         self.track_to_person.get(
                             target.get("track_id", -1), target.get("face_id", "unknown")
@@ -1357,10 +1469,7 @@ class SalienceNetworkModule(yarp.RFModule):
         time.sleep(1.0)
         for attempt in range(5):
             try:
-                if (
-                    self.executive_control_rpc
-                    and self.executive_control_rpc.getOutputCount() > 0
-                ):
+                if self._ensure_exec_rpc_connected(log_on_fail=False):
                     cmd = yarp.Bottle()
                     cmd.addString("status")
                     reply = yarp.Bottle()
@@ -1369,11 +1478,29 @@ class SalienceNetworkModule(yarp.RFModule):
             except Exception:
                 time.sleep(2.0)
 
+    def _ensure_exec_rpc_connected(self, log_on_fail: bool = True) -> bool:
+        try:
+            if self.executive_control_rpc is None:
+                return False
+            if self.executive_control_rpc.getOutputCount() > 0:
+                return True
+            local = self._exec_rpc_local_name or f"/{self.module_name}/executiveControl:rpc"
+            ok = yarp.Network.connect(local, self.executive_control_rpc_name)
+            if ok:
+                return self.executive_control_rpc.getOutputCount() > 0
+            if log_on_fail:
+                self._log("DEBUG", f"exec: reconnect failed ({local} -> {self.executive_control_rpc_name})")
+            return False
+        except Exception as e:
+            if log_on_fail:
+                self._log("WARNING", f"exec: reconnect error: {e}")
+            return False
+
     def _run_executive_control(
         self, track_id: int, face_id: str, start_state: str
     ) -> Optional[Dict]:
         try:
-            if self.executive_control_rpc.getOutputCount() == 0:
+            if not self._ensure_exec_rpc_connected(log_on_fail=False):
                 self._log("WARNING", "exec: not connected")
                 return None
             cmd = yarp.Bottle()
@@ -1393,7 +1520,7 @@ class SalienceNetworkModule(yarp.RFModule):
                             if (
                                 isinstance(parsed, dict)
                                 and parsed.get("error")
-                                == "responsive_interaction_running"
+                                == "reactive_interaction_running"
                             ):
                                 self._log(
                                     "INFO",
@@ -1410,7 +1537,7 @@ class SalienceNetworkModule(yarp.RFModule):
 
     def _executive_control_status(self) -> Optional[Dict]:
         try:
-            if self.executive_control_rpc.getOutputCount() == 0:
+            if not self._ensure_exec_rpc_connected(log_on_fail=False):
                 return None
             cmd = yarp.Bottle()
             cmd.addString("status")
@@ -1657,11 +1784,6 @@ class SalienceNetworkModule(yarp.RFModule):
             f"talked:{len(self.talked_today)} "
             f"learning:{len(self.learning_data)}",
         )
-
-    def _save_all_json_files(self):
-        self._save_greeted_json()
-        self._save_talked_json()
-        self._save_learning_json()
 
     def _load_json(self, path: Path, default: Any) -> Any:
         try:
@@ -2033,10 +2155,91 @@ class SalienceNetworkModule(yarp.RFModule):
 
     def _log(self, level: str, message: str):
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        print(f"[{ts}] [{level}] {message}")
+        line = f"[{ts}] [{level}] {message}\n"
+        try:
+            print(line, end="")
+        except RuntimeError:
+            # Ctrl+C can interrupt an in-flight buffered print and YARP may re-enter
+            # shutdown hooks; fall back to a low-level write in that case.
+            try:
+                os.write(2, line.encode("utf-8", errors="replace"))
+            except Exception:
+                pass
 
 
 # ==================== Main Entry Point ====================
+
+def _run_module_with_main_thread_signals(
+    module: SalienceNetworkModule, rf: yarp.ResourceFinder
+) -> bool:
+    stop_requested = threading.Event()
+    run_done = threading.Event()
+    run_state: Dict[str, Any] = {"result": False, "error": None}
+
+    def _runner():
+        try:
+            run_state["result"] = bool(module.runModule(rf))
+        except BaseException as e:
+            run_state["error"] = e
+        finally:
+            run_done.set()
+
+    def _handle_signal(signum, _frame):
+        if stop_requested.is_set():
+            return
+        stop_requested.set()
+        try:
+            os.write(
+                2,
+                f"\n[INFO] SalienceNetworkModule received signal {signum}, shutting down.\n".encode(
+                    "utf-8", errors="replace"
+                ),
+            )
+        except Exception:
+            pass
+
+    previous_handlers = {}
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            previous_handlers[sig] = signal.getsignal(sig)
+            signal.signal(sig, _handle_signal)
+        except Exception:
+            pass
+
+    run_thread = threading.Thread(
+        target=_runner,
+        name=f"{module.module_name}-runModule",
+        daemon=True,
+    )
+    run_thread.start()
+
+    interrupted = False
+    shutdown_deadline: Optional[float] = None
+    try:
+        while not run_done.wait(0.2):
+            if stop_requested.is_set() and not interrupted:
+                interrupted = True
+                shutdown_deadline = time.time() + 2.0
+                module.interruptModule()
+            elif (
+                interrupted
+                and shutdown_deadline is not None
+                and time.time() >= shutdown_deadline
+            ):
+                break
+    finally:
+        for sig, handler in previous_handlers.items():
+            try:
+                signal.signal(sig, handler)
+            except Exception:
+                pass
+        module.interruptModule()
+        module.close()
+
+    run_thread.join(timeout=0.5)
+    if run_state["error"] is not None:
+        raise run_state["error"]
+    return bool(run_state["result"])
 
 if __name__ == "__main__":
     yarp.Network.init()
@@ -2061,13 +2264,9 @@ if __name__ == "__main__":
     print("=" * 55)
 
     try:
-        if not module.runModule(rf):
+        if not _run_module_with_main_thread_signals(module, rf):
             print("[ERROR] Module failed to run.")
             sys.exit(1)
-    except KeyboardInterrupt:
-        print("\n[INFO] Interrupted by user")
     finally:
-        module.interruptModule()
-        module.close()
         yarp.Network.fini()
         print("[INFO] Module closed.")

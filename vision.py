@@ -757,7 +757,11 @@ class VisionAnalyzer(yarp.RFModule):
             return
 
         gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
-        raw_val, pts, _ = self.qr_detector.detectAndDecode(gray)
+        try:
+            raw_val, pts, _ = self.qr_detector.detectAndDecode(gray)
+        except cv2.error as e:
+            self.logger.warning(f"QR detection failed: {e}")
+            return
 
         # No valid QR in this sampled frame: count misses and clear active state
         # after a small hysteresis window to avoid flicker-triggered re-emits.
@@ -1140,11 +1144,16 @@ class VisionAnalyzer(yarp.RFModule):
         # Track which bboxes have been matched (one-to-one matching)
         matched_track_ids = set()
         current_time = time.time()
+        face_observations = []
 
         if results.face_landmarks:
             for face_landmarks in results.face_landmarks:
 
                 face_2d = []
+                all_landmarks_2d = []
+
+                for lm in face_landmarks:
+                    all_landmarks_2d.append([lm.x * img_w, lm.y * img_h])
 
                 for idx in LANDMARK_IDS:
                     lm = face_landmarks[idx]
@@ -1153,10 +1162,17 @@ class VisionAnalyzer(yarp.RFModule):
                     face_2d.append([x, y])
 
                 face_2d = np.array(face_2d, dtype=np.float64)
+                all_landmarks_2d = np.array(all_landmarks_2d, dtype=np.float64)
 
                 # Calculate face center from landmarks for matching with bboxes
-                face_center_x = np.mean(face_2d[:, 0])
-                face_center_y = np.mean(face_2d[:, 1])
+                face_center_x = np.mean(all_landmarks_2d[:, 0])
+                face_center_y = np.mean(all_landmarks_2d[:, 1])
+                face_bbox = (
+                    float(np.min(all_landmarks_2d[:, 0])),
+                    float(np.min(all_landmarks_2d[:, 1])),
+                    float(np.max(all_landmarks_2d[:, 0]) - np.min(all_landmarks_2d[:, 0])),
+                    float(np.max(all_landmarks_2d[:, 1]) - np.min(all_landmarks_2d[:, 1])),
+                )
 
                 focal_length = img_w
                 cam_matrix = np.array([
@@ -1201,60 +1217,83 @@ class VisionAnalyzer(yarp.RFModule):
                 else:
                     attention = "AWAY"
 
-                # Match MediaPipe detection with face identity footprint
-                matched_face = self._match_face_to_bbox(face_center_x, face_center_y, matched_track_ids)
-                
-                # Mark this face as matched to prevent duplicate assignments
+                face_observations.append({
+                    "landmarks": face_landmarks,
+                    "center": (face_center_x, face_center_y),
+                    "bbox": face_bbox,
+                    "gaze_direction": face_forward,
+                    "pitch": pitch,
+                    "yaw": yaw,
+                    "roll": roll,
+                    "cos_angle": cos_angle,
+                    "attention": attention,
+                })
+
+        matched_faces = self._associate_face_observations(face_observations)
+
+        for obs_idx, obs in enumerate(face_observations):
+            matched_face = matched_faces.get(obs_idx)
+            if matched_face:
+                matched_track_ids.add(matched_face['track_id'])
+
+            # Compute talking detection based on lip motion
+            # Landmarks 13 (upper inner lip) and 14 (lower inner lip)
+            is_talking = 0
+            face_landmarks = obs["landmarks"]
+            if len(face_landmarks) > 14:
+                upper_lip = face_landmarks[13]
+                lower_lip = face_landmarks[14]
+
+                # Compute mouth opening in normalized coordinates
+                mouth_open_raw = np.hypot(upper_lip.x - lower_lip.x, upper_lip.y - lower_lip.y)
+
+                # Normalize by face bbox height if available (scale-invariant)
                 if matched_face:
-                    matched_track_ids.add(matched_face['track_id'])
-                
-                # Compute talking detection based on lip motion
-                # Landmarks 13 (upper inner lip) and 14 (lower inner lip)
-                is_talking = 0
-                if len(face_landmarks) > 14:
-                    upper_lip = face_landmarks[13]
-                    lower_lip = face_landmarks[14]
-                    
-                    # Compute mouth opening in normalized coordinates
-                    mouth_open_raw = np.hypot(upper_lip.x - lower_lip.x, upper_lip.y - lower_lip.y)
-                    
-                    # Normalize by face bbox height if available (scale-invariant)
-                    if matched_face:
-                        x, y, w, h = matched_face['bbox']
-                        # Normalize: mouth_open as fraction of face height
-                        mouth_open = mouth_open_raw / (h / self.default_height) if h > 0 else mouth_open_raw
-                        track_id = matched_face['track_id']
-                    else:
-                        # If unmatched, use raw normalized coords (less reliable)
-                        mouth_open = mouth_open_raw
-                        track_id = -1  # Unmatched
-                    
-                    # Update motion history for this track_id
-                    if track_id != -1:
-                        if track_id not in self.mouth_motion_history:
-                            self.mouth_motion_history[track_id] = deque(maxlen=self.mouth_buffer_size)
-                        
-                        self.mouth_motion_history[track_id].append(mouth_open)
-                        self.last_seen_track[track_id] = current_time
-                        
-                        # Compute motion as std of mouth opening history
-                        if len(self.mouth_motion_history[track_id]) >= 3:
-                            mouth_motion = np.std(self.mouth_motion_history[track_id])
-                            # Threshold: tune this for sensitivity (higher = less sensitive)
-                            # 0.015 works well for normalized values; adjust if needed
-                            is_talking = 1 if mouth_motion > self.talking_threshold else 0
-                
-                # Compute time_in_view
-                if matched_face:
+                    x, y, w, h = matched_face['bbox']
+                    # Normalize: mouth_open as fraction of face height
+                    mouth_open = mouth_open_raw / (h / self.default_height) if h > 0 else mouth_open_raw
                     track_id = matched_face['track_id']
-                    if track_id not in self.first_seen_track:
-                        self.first_seen_track[track_id] = current_time
-                    time_in_view = current_time - self.first_seen_track[track_id]
                 else:
-                    time_in_view = 0.0
-                
-                # Publish per-face landmarks data
-                self._publish_landmarks(matched_face, face_forward, pitch, yaw, roll, cos_angle, attention, is_talking, time_in_view)
+                    # If unmatched, use raw normalized coords (less reliable)
+                    mouth_open = mouth_open_raw
+                    track_id = -1  # Unmatched
+
+                # Update motion history for this track_id
+                if track_id != -1:
+                    if track_id not in self.mouth_motion_history:
+                        self.mouth_motion_history[track_id] = deque(maxlen=self.mouth_buffer_size)
+
+                    self.mouth_motion_history[track_id].append(mouth_open)
+                    self.last_seen_track[track_id] = current_time
+
+                    # Compute motion as std of mouth opening history
+                    if len(self.mouth_motion_history[track_id]) >= 3:
+                        mouth_motion = np.std(self.mouth_motion_history[track_id])
+                        # Threshold: tune this for sensitivity (higher = less sensitive)
+                        # 0.015 works well for normalized values; adjust if needed
+                        is_talking = 1 if mouth_motion > self.talking_threshold else 0
+
+            # Compute time_in_view
+            if matched_face:
+                track_id = matched_face['track_id']
+                if track_id not in self.first_seen_track:
+                    self.first_seen_track[track_id] = current_time
+                time_in_view = current_time - self.first_seen_track[track_id]
+            else:
+                time_in_view = 0.0
+
+            # Publish per-face landmarks data
+            self._publish_landmarks(
+                matched_face,
+                obs["gaze_direction"],
+                obs["pitch"],
+                obs["yaw"],
+                obs["roll"],
+                obs["cos_angle"],
+                obs["attention"],
+                is_talking,
+                time_in_view,
+            )
         
         # Publish data for faces detected by identity tracker but not matched by MediaPipe
         # (e.g., faces too small for landmark detection)
@@ -1291,57 +1330,80 @@ class VisionAnalyzer(yarp.RFModule):
             if tid in self.first_seen_track:
                 del self.first_seen_track[tid]
 
-    def _match_face_to_bbox(self, face_x, face_y, matched_track_ids):
-        """Match MediaPipe face detection to object recognition face using distance-based scoring.
-        
-        Implements one-to-one matching: each bbox can only be assigned to one MediaPipe face.
-        Computes distance from face center to each bbox center, selects the closest match
-        within MAX_FACE_MATCH_DISTANCE threshold. Ties are broken by preferring larger bbox area.
-        
-        Args:
-            face_x: X coordinate of MediaPipe face center
-            face_y: Y coordinate of MediaPipe face center
-            matched_track_ids: Set of track_ids that have already been matched
-            
-        Returns:
-            Best matching face_data dict or None if no valid match found
-        """
-        if not self.detected_faces:
-            return None
-        
-        best_match = None
-        best_distance = float('inf')
-        
-        for face_data in self.detected_faces:
-            # Skip faces that have already been matched (one-to-one constraint)
-            if face_data['track_id'] in matched_track_ids:
+    def _associate_face_observations(self, face_observations):
+        """Associate MediaPipe faces to tracked detections using frame-level one-to-one matching."""
+        if not face_observations or not self.detected_faces:
+            return {}
+
+        candidate_pairs = []
+
+        for obs_idx, obs in enumerate(face_observations):
+            face_x, face_y = obs["center"]
+            face_bbox = obs["bbox"]
+
+            for face_data in self.detected_faces:
+                track_id = face_data.get("track_id", -1)
+                if track_id < 0:
+                    continue
+
+                x, y, w, h = face_data["bbox"]
+                bbox_center_x = x + w / 2.0
+                bbox_center_y = y + h / 2.0
+                center_distance = np.hypot(face_x - bbox_center_x, face_y - bbox_center_y)
+                adaptive_distance_limit = max(self.max_face_match_distance, 0.6 * max(w, h))
+                center_inside_bbox = x <= face_x <= (x + w) and y <= face_y <= (y + h)
+                overlap_ratio = self._bbox_overlap_ratio(face_bbox, face_data["bbox"])
+
+                if (
+                    not center_inside_bbox
+                    and center_distance > adaptive_distance_limit
+                    and overlap_ratio < 0.15
+                ):
+                    continue
+
+                distance_norm = center_distance / max(max(w, h), 1.0)
+                score = distance_norm
+                if not center_inside_bbox:
+                    score += 0.75
+                score -= min(overlap_ratio, 1.0) * 0.5
+
+                candidate_pairs.append(
+                    (score, -overlap_ratio, center_distance, obs_idx, track_id, face_data)
+                )
+
+        candidate_pairs.sort()
+
+        matched_observations = set()
+        matched_track_ids = set()
+        assignments = {}
+
+        for _, _, _, obs_idx, track_id, face_data in candidate_pairs:
+            if obs_idx in matched_observations or track_id in matched_track_ids:
                 continue
-            
-            x, y, w, h = face_data['bbox']
-            
-            # Compute bbox center
-            bbox_center_x = x + w / 2.0
-            bbox_center_y = y + h / 2.0
-            
-            # Compute Euclidean distance from face center to bbox center
-            distance = np.hypot(face_x - bbox_center_x, face_y - bbox_center_y)
-            
-            # Update best match if this is closer
-            if distance < best_distance:
-                best_distance = distance
-                best_match = face_data
-            elif distance == best_distance and best_match is not None:
-                # Tie-breaker: prefer larger bbox area for stability
-                current_area = w * h
-                best_area = best_match['bbox'][2] * best_match['bbox'][3]
-                if current_area > best_area:
-                    best_match = face_data
-        
-        # Apply gating threshold to reject poor matches
-        if best_distance > self.max_face_match_distance:
-            return None
-        
-        return best_match
+
+            assignments[obs_idx] = face_data
+            matched_observations.add(obs_idx)
+            matched_track_ids.add(track_id)
+
+        return assignments
+
+    @staticmethod
+    def _bbox_overlap_ratio(bbox_a, bbox_b):
+        """Return intersection over the smaller bbox area to tolerate detector scale mismatch."""
+        ax, ay, aw, ah = bbox_a
+        bx, by, bw, bh = bbox_b
+
+        inter_x1 = max(ax, bx)
+        inter_y1 = max(ay, by)
+        inter_x2 = min(ax + aw, bx + bw)
+        inter_y2 = min(ay + ah, by + bh)
+
+        inter_w = max(0.0, inter_x2 - inter_x1)
+        inter_h = max(0.0, inter_y2 - inter_y1)
+        inter_area = inter_w * inter_h
+        min_area = max(min(aw * ah, bw * bh), 1.0)
+
+        return inter_area / min_area
 
     def _publish_landmarks(self, face_data, gaze_direction, pitch, yaw, roll, cos_angle, attention, is_talking, time_in_view):
         """Publish detailed landmarks information for a single face."""
@@ -1542,6 +1604,8 @@ class VisionAnalyzer(yarp.RFModule):
         self.target_box_port.interrupt()
         self.handle_port.interrupt()
         self.face_detection_img_port.interrupt()
+        if getattr(self, "qr_port", None) is not None:
+            self.qr_port.interrupt()
         return True
 
     def close(self):
@@ -1553,6 +1617,13 @@ class VisionAnalyzer(yarp.RFModule):
         self.target_box_port.close()
         self.handle_port.close()
         self.face_detection_img_port.close()
+        if getattr(self, "qr_port", None) is not None:
+            self.qr_port.close()
+        if getattr(self, "face_mesh", None) is not None:
+            try:
+                self.face_mesh.close()
+            except Exception:
+                pass
         return True
 
 
@@ -1572,8 +1643,17 @@ if __name__ == '__main__':
     rf.setVerbose(True)
     rf.setDefaultContext('alwaysOn')
 
-    if rf.configure(sys.argv):
-        vision_analyzer.runModule(rf)
-
-    yarp.Network.fini()
+    try:
+        if rf.configure(sys.argv):
+            vision_analyzer.runModule(rf)
+    finally:
+        try:
+            vision_analyzer.interruptModule()
+        except Exception:
+            pass
+        try:
+            vision_analyzer.close()
+        except Exception:
+            pass
+        yarp.Network.fini()
     sys.exit(0)

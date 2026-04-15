@@ -94,7 +94,7 @@ class ChatBotModule(yarp.RFModule):
         self._stale_warned: bool = False
 
         # Prompts
-        self._prompts_path: str = os.path.join(self._alwayson_dir, self.PROMPTS_FILENAME)
+        self._prompts_path: str = os.path.join(self._script_dir, self.PROMPTS_FILENAME)
         self._prompts: Dict[str, Any] = {}
 
         # Telegram
@@ -110,7 +110,10 @@ class ChatBotModule(yarp.RFModule):
         self._llm: Optional[AzureOpenAI] = None
         self._llm_deployment: str = ""
         self._llm_api_version: str = ""
-        self._llm_max_tokens: int = 300
+        self._llm_max_tokens: int = 512
+        self._llm_reply_max_tokens: int = 220
+        self._llm_hs3_broadcast_max_tokens: int = 160
+        self._llm_summary_max_tokens: int = 512
 
         self._db: Optional[sqlite3.Connection] = None
         self._user_memory: Dict[str, Dict[str, Any]] = {}  # in-memory cache, persisted to SQLite
@@ -386,10 +389,38 @@ class ChatBotModule(yarp.RFModule):
         return self._raw_hs
 
     # ------------------------- Prompts -------------------------
+    def _resolve_prompts_path(self) -> str:
+        candidates = [
+            self._prompts_path,
+            os.path.join(self._script_dir, self.PROMPTS_FILENAME),
+            os.path.join(self._alwayson_dir, self.PROMPTS_FILENAME),
+        ]
+
+        seen = set()
+        unique_candidates = []
+        for candidate in candidates:
+            if not candidate:
+                continue
+            norm = os.path.abspath(candidate)
+            if norm in seen:
+                continue
+            seen.add(norm)
+            unique_candidates.append(norm)
+
+        for candidate in unique_candidates:
+            if os.path.isfile(candidate):
+                return candidate
+
+        raise FileNotFoundError(
+            "prompts.json not found. Tried: " + ", ".join(unique_candidates)
+        )
+
     def _load_prompts(self) -> None:
-        with open(self._prompts_path, "r", encoding="utf-8") as f:
+        resolved_path = self._resolve_prompts_path()
+        with open(resolved_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         self._prompts = data.get("chat_bot", data)
+        self._prompts_path = resolved_path
         self._log("INFO", f"Prompts loaded: {self._prompts_path}")
 
     def _system_prompt(self, hs: str) -> str:
@@ -677,7 +708,7 @@ class ChatBotModule(yarp.RFModule):
 
         self._tg_typing(chat_id)
 
-        llm_reply = self._llm_chat(messages)
+        llm_reply = self._llm_chat(messages, max_tokens=self._llm_reply_max_tokens)
         used_fallback = not bool(llm_reply)
         reply_text = llm_reply or self._fallback(hs)
         self._tg_send(chat_id, reply_text)
@@ -792,14 +823,43 @@ class ChatBotModule(yarp.RFModule):
             api_version=api_version,
         )
 
-        self._llm_max_tokens = int(self._get_env("TELEGRAM_LLM_MAX_TOKENS") or "4000")  # override via env
-        if self._llm_max_tokens < 500:
-            self._log("WARN", f"TELEGRAM_LLM_MAX_TOKENS={self._llm_max_tokens} is very low; consider >= 4000")
+        self._llm_max_tokens = int(self._get_env("TELEGRAM_LLM_MAX_TOKENS") or "512")
+        self._llm_reply_max_tokens = int(
+            self._get_env("TELEGRAM_LLM_REPLY_MAX_TOKENS") or "220"
+        )
+        self._llm_hs3_broadcast_max_tokens = int(
+            self._get_env("TELEGRAM_LLM_HS3_MAX_TOKENS") or "160"
+        )
+        self._llm_summary_max_tokens = int(
+            self._get_env("TELEGRAM_LLM_SUMMARY_MAX_TOKENS") or "512"
+        )
+
+        self._llm_reply_max_tokens = max(64, min(self._llm_reply_max_tokens, self._llm_max_tokens))
+        self._llm_hs3_broadcast_max_tokens = max(64, min(self._llm_hs3_broadcast_max_tokens, self._llm_max_tokens))
+        self._llm_summary_max_tokens = max(128, min(self._llm_summary_max_tokens, self._llm_max_tokens))
+
+        if self._llm_summary_max_tokens <= self._llm_reply_max_tokens:
+            self._log(
+                "WARN",
+                f"Summary token cap ({self._llm_summary_max_tokens}) should be higher than reply cap ({self._llm_reply_max_tokens})",
+            )
+
+        self._log(
+            "INFO",
+            "LLM token caps: "
+            f"global={self._llm_max_tokens}, "
+            f"reply={self._llm_reply_max_tokens}, "
+            f"hs3_broadcast={self._llm_hs3_broadcast_max_tokens}, "
+            f"summary={self._llm_summary_max_tokens}",
+        )
         return client, deployment, api_version
 
-    def _llm_chat(self, messages: List[Dict[str, str]]) -> str:
+    def _llm_chat(self, messages: List[Dict[str, str]], max_tokens: Optional[int] = None) -> str:
         if not self._llm:
             return ""
+
+        token_budget = int(max_tokens if max_tokens is not None else self._llm_max_tokens)
+        token_budget = max(32, token_budget)
 
         last_exc: Optional[Exception] = None
         use_completion_tokens = True
@@ -811,9 +871,9 @@ class ChatBotModule(yarp.RFModule):
                     "messages": messages,
                 }
                 if use_completion_tokens:
-                    kwargs["max_completion_tokens"] = self._llm_max_tokens
+                    kwargs["max_completion_tokens"] = token_budget
                 else:
-                    kwargs["max_tokens"] = self._llm_max_tokens
+                    kwargs["max_tokens"] = token_budget
 
                 resp = self._llm.chat.completions.create(**kwargs)
                 content = (resp.choices[0].message.content or "").strip()
@@ -856,7 +916,7 @@ class ChatBotModule(yarp.RFModule):
             {"role": "system", "content": self._summarize_system_prompt()},
             {"role": "user", "content": known_facts + convo},
         ]
-        out = self._llm_chat(msgs)
+        out = self._llm_chat(msgs, max_tokens=self._llm_summary_max_tokens)
         return (out or "")[:400].strip()
 
     def _llm_hs3_broadcast(self) -> str:
@@ -864,7 +924,7 @@ class ChatBotModule(yarp.RFModule):
         if not sys_p or not usr_p:
             return ""
         msgs = [{"role": "system", "content": sys_p}, {"role": "user", "content": usr_p}]
-        return self._llm_chat(msgs)
+        return self._llm_chat(msgs, max_tokens=self._llm_hs3_broadcast_max_tokens)
 
     def _fallback(self, hs: str) -> str:
         if hs == "HS3":
