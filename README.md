@@ -54,11 +54,6 @@ Four continuously running layers, each with a distinct responsibility:
  +------------------------------+
 ```
 
-Supporting utilities:
-
-- `generateQr.py` — generates `SMALL_MEAL`, `MEDIUM_MEAL`, and `LARGE_MEAL` QR PNGs
-- `mockPublisher.py` — synthetic STM context and hunger stream for integration testing
-
 ---
 
 ## 2) End-to-End Dataflow
@@ -83,7 +78,7 @@ Supporting utilities:
 [executiveControl on run()]
   -> starts target monitor thread (abort if face gone > 12s)
   -> chooses behavior path: hunger tree or social SS tree
-  -> TTS/STT exchanges, async LLM for responses
+  -> TTS/STT exchanges, synchronous starter + latest-only async LLM follow-up replies
   -> writes greeted/talked/replied_any flags + compact analytics fields to SQLite
   -> publishes hunger state continuously
 
@@ -240,7 +235,7 @@ Applied only to the current tracked face and only when both are true:
 
 ```text
 t_idle      = min(time_in_view, time_since_last_interaction)
-habituation = exp(-0.05 * t_idle)
+habituation = exp(-0.10 * t_idle)
 ips_current = ips_current * habituation
 ```
 
@@ -373,11 +368,11 @@ run(track_id, face_id, ss)
 ```text
 1. Look up face name in Telegram DB for personalized context
    (likes, dislikes, topics, inside jokes, age)
-2. Generate conversation starter via async LLM
-   (background-generated in advance; bounded local wait with fallback)
+2. Generate conversation starter via direct LLM call
+  (at turn start, with local fallback on failure)
 3. Speak starter
 4. Up to 3 turns:
-     wait STT utterance (12 s timeout)
+  wait STT utterance (15 s timeout)
      → submit follow-up or closing LLM request (async, fallback)
      → speak reply
 5. If user responded at least once → talked=True, success, advance to ss4
@@ -415,7 +410,7 @@ mode switch always resets stored level to 100%
 
 ```text
 1. Ask for food ("I'm hungry, would you feed me?")
-2. Wait for a QR scan (up to feed_wait_timeout_sec)
+2. Wait for a QR scan (up to `feed_wait_timeout_sec`, default 8 s)
 3. QR received  → apply meal delta, then acknowledge feed
                 → if still hungry → ask for more
                 → if HS1 reached  → done
@@ -455,22 +450,23 @@ Event arrives
 
 ### LLM execution model
 
-All LLM calls are submitted asynchronously to avoid blocking the interaction thread.
+SS3 replies use a latest-only asynchronous worker so new user speech can supersede older in-flight LLM requests.
 
 ```text
 interaction thread
-  -> submit_llm_request(kind, utterance, user_context)
-  -> bounded local wait (1.0 s)
-  -> if result ready: use it
-     if not: use fallback string (never stall TTS)
+  -> submit request to LatestOnlyLlmWorker
+  -> keep polling worker events + keep listening to STT
+  -> if newer user utterance arrives first: supersede current request
+  -> if final reply arrives: speak it
+  -> if LLM error: use local fallback (never stall conversation)
 
 background:
-  -> async LLM worker drains request queue
-  -> stores result in result map
-  -> cancelled requests discarded
+  -> bounded parallel worker threads run Azure calls
+  -> emits first_token / final / error / cancelled events
+  -> stale or superseded results are discarded
 ```
 
-A conversation starter for SS3 is pre-generated in the background before it is needed.
+The SS3 conversation starter is generated at turn start (synchronous call with local fallback).
 
 ### Ports and RPC
 
@@ -572,29 +568,7 @@ Additionally, Telegram metadata (sender name from `from.first_name`) is used to 
 
 ---
 
-## 3.5 `mockPublisher.py` — Test Stream Generator
-
-Publishes synthetic channels for integration testing without the full upstream stack:
-
-- `/alwayson/stm/context:o` → `(episode_id, chunk, label)` — STM context labels
-- `/interactionManager/hunger:o` → hunger state transitions over `{HS1, HS2, HS3}`
-  (compatibility stream using historical naming; live architecture uses `/alwayson/executiveControl/hunger:o`)
-
----
-
-## 3.6 `generateQr.py` — Feed QR Generator
-
-Generates QR PNGs for the hunger feeding path:
-
-- `small_meal.png` → `SMALL_MEAL`
-- `medium_meal.png` → `MEDIUM_MEAL`
-- `large_meal.png` → `LARGE_MEAL`
-
-Run with `--verify` to decode and validate generated QR codes.
-
----
-
-## 3.7 `prompts.json` — Prompt Surface
+## 3.5 `prompts.json` — Prompt Surface
 
 Central prompt file loaded by both `executiveControl` and `chatBot` at startup, with runtime reload support.
 
@@ -603,8 +577,9 @@ Central prompt file loaded by both `executiveControl` and `chatBot` at startup, 
 - `system_default` now emphasizes emotional mirroring, varied sentence openings, and natural kid-like hesitation phrases
 - `ss1_greeting`, `ss1_ask_name`, `ss1_ask_name_retry`, `ss1_nice_to_meet`
 - `ss2_greeting`
-- `convo_starter_fallback`, `ss3_mid_turn_fallback`, `closing_ack_fallback`
-- `hunger_ask_feed`, `hunger_thank_feed`, `hunger_still_hungry`, `hunger_look_around`
+- `convo_starter_prompt[_hs1|_hs2]`, `followup_prompt[_hs1|_hs2]`, `closing_ack_prompt[_hs1|_hs2]`
+- `hunger_ask_feed`, `hunger_still_hungry`, `hunger_look_around`, `feed_ack_hs1|feed_ack_hs2|feed_ack_hs3`
+- `reactive_greeting`
 
 **`chat_bot` section:**
 - `base_system_prompt`
@@ -674,7 +649,7 @@ manual override active               → use overridden state regardless of stal
 ```text
 monitor thread checks landmarks every ~67 ms
   → face present           → last_seen reset
-  → face absent > 12 s     → abort_event set
+  → face absent > 12 s     → interaction abort flag set
                               → stops all waits (STT / LLM / speech)
                               → returns result with abort_reason = "target_lost"
 ```
@@ -694,7 +669,7 @@ SS2:
   attempt 2 no response                    → abort no_response_greeting
 
 SS3:
-  starter sent, no utterance in 12 s       → abort no_response_conversation
+  starter sent, no utterance in 15 s       → abort no_response_conversation
 ```
 
 ### 5.3 Responsive event gating
@@ -723,7 +698,7 @@ all pass       → spawn interaction thread
 ### 5.5 Queue pressure
 
 ```text
-any internal queue full (DB / IO / responsive / Telegram)
+any internal queue full (DB / IO / Telegram)
   → drop oldest entry
   → enqueue newest
   → main loop continues without blocking
@@ -852,7 +827,7 @@ module main loop
 
 ### 7.4.1 Analytics SQL views (auto-created at startup)
 
-- `executiveControl.py` creates: `v_proactive_interactions`, `v_metric_ss3_to_ss4_daily`, `v_metric_daily_interactions_completed`, `v_metric_proactive_response_rate_daily`, `v_metric_repeat_users_daily`, `v_metric_ss1ss2_to_ss4_daily`
+- `executiveControl.py` creates: `v_proactive_interactions`, `v_metric_ss3_daily`, `v_metric_response_rate_daily`
 - `salienceNetwork.py` creates: `v_interaction_attempts_clean`, `v_interaction_attempts_daily`
 - `chatBot.py` creates: `v_chat_events_clean`, `v_chat_daily_metrics`
 
@@ -889,7 +864,7 @@ executiveControl.py
   - landmarks reader thread (continuous)
   - QR reader thread (continuous)
   - responsive loop thread (continuous)
-  - async LLM worker thread (request queue drain)
+  - latest-only LLM worker manager (spawns bounded per-request worker threads)
   - DB worker thread (SQLite inserts)
 
 chatBot.py
@@ -908,7 +883,6 @@ chatBot.py
 4. executiveControl.py
 5. chatBot.py
 6. Connect YARP ports (see §6.1)
-7. Optional: mockPublisher.py for testing without full upstream stack
 ```
 
 ---
