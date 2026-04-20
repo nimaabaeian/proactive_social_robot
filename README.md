@@ -79,13 +79,14 @@ Four continuously running layers, each with a distinct responsibility:
   -> starts target monitor thread (abort if face gone > 12s)
   -> chooses behavior path: hunger tree or social SS tree
   -> TTS/STT exchanges, synchronous starter + latest-only async LLM follow-up replies
-  -> writes greeted/talked/replied_any flags + compact analytics fields to SQLite
+  -> writes replied/greeted/talked + turn-depth/trigger/hunger analytics to SQLite
   -> publishes hunger state continuously
 
 [chatBot main loop @ 10 Hz]
   -> reads hunger port
   -> drains Telegram update queue (up to 25/cycle)
   -> generates hunger-aware LLM replies
+  -> groups messages into inactivity-based sessions (30 min gap)
   -> extracts user profile from message text
   -> broadcasts HS3 starvation alerts to subscribers
 ```
@@ -321,7 +322,7 @@ STM missing               → default cooldown (5 s)
 - Publishes current hunger state to `chatBot`
 - Performs cross-channel personalization: looks up the face's name in the Telegram DB to personalize face-to-face conversation with learned preferences (likes, dislikes, topics, inside jokes)
 - Uses Azure OpenAI for name extraction and short conversational turns
-- Logs compact interaction analytics (e.g., replied-any, hunger context, meal outcomes) to SQLite
+- Logs compact interaction analytics (e.g., replied-any, hunger context, turn depth, trigger mode) to SQLite
 
 ### Behavior routing
 
@@ -501,7 +502,8 @@ Maintains a persistent social relationship with each user over Telegram, indepen
 - Extracts user profile from message text via regex (no extra LLM call needed)
 - Periodically summarizes conversation history to keep context compact
 - Broadcasts starvation alerts (HS3) to all Telegram subscribers
-- Logs per-message/per-broadcast analytics events and creates daily SQL metric views
+- Tracks inactivity-based chat sessions (new session after 30 min idle)
+- Logs per-message/per-broadcast analytics with `session_id` and `turn_count_at_event`, then builds daily/user/session SQL views
 
 ### Hunger-driven persona
 
@@ -803,7 +805,7 @@ Relationship scale (permanent)
 |---|---|
 | `salienceNetwork.py` | `greeted_today.json`, `talked_today.json`, `learning.json`, `salience_network.db` (+ analytics SQL views) |
 | `executiveControl.py` | `last_greeted.json`, `greeted_today.json`, `hunger_state.json`, `executive_control.db` (expanded interaction analytics fields + SQL views) |
-| `chatBot.py` | `chat_bot.db` (`meta`, `subscribers`, `chat_memory`, `user_memory`, `chat_events`) + analytics SQL views |
+| `chatBot.py` | `chat_bot.db` (`meta`, `subscribers`, `chat_memory`, `user_memory`, `chat_events` with `session_id` + `turn_count_at_event`) + analytics SQL views |
 
 ### 7.3 Write safety model
 
@@ -821,15 +823,15 @@ module main loop
 
 | Database | Tables | Contents |
 |---|---|---|
-| `data_collection/executive_control.db` | `interactions`, `responsive_interactions` | Proactive + responsive records, including replied-any and hunger-context analytics fields |
-| `data_collection/salience_network.db` | `target_selections`, `ss_changes`, `learning_changes`, `interaction_attempts` | Selection events, learning deltas, and interaction-attempt analytics |
-| `memory/chat_bot.db` | `meta`, `subscribers`, `chat_memory`, `user_memory`, `chat_events` | Telegram state, per-chat history, per-user profiles, and per-message/broadcast analytics |
+| `data_collection/executive_control.db` | `interactions`, `reactive_interactions` | Proactive + reactive records, including replied-any, turn-depth (`n_turns`), trigger mode, and hunger transition fields |
+| `data_collection/salience_network.db` | `target_selections`, `ss_changes`, `learning_changes`, `interaction_attempts` | Selection events, learning deltas, and interaction attempts enriched with `hunger_state` + proactive flag |
+| `memory/chat_bot.db` | `meta`, `subscribers`, `chat_memory`, `user_memory`, `chat_events` | Telegram state, per-chat history, per-user profiles, and per-event analytics including `session_id` + turn-count snapshots |
 
 ### 7.4.1 Analytics SQL views (auto-created at startup)
 
-- `executiveControl.py` creates: `v_proactive_interactions`, `v_metric_ss3_daily`, `v_metric_response_rate_daily`
-- `salienceNetwork.py` creates: `v_interaction_attempts_clean`, `v_interaction_attempts_daily`
-- `chatBot.py` creates: `v_chat_events_clean`, `v_chat_daily_metrics`
+- `executiveControl.py` creates: `v_proactive_interactions`, `v_metric_ss3_daily`, `v_metric_response_rate_daily`, `v_metric_repeat_users_daily`, `v_metric_depth_progression`
+- `salienceNetwork.py` creates: `v_interaction_attempts_clean`, `v_interaction_attempts_daily` (grouped by `day_rome`, `hunger_state`, `start_ss`)
+- `chatBot.py` creates: `v_chat_events_clean`, `v_chat_daily_metrics`, `v_chat_user_daily`, `v_chat_session_metrics`
 
 ### 7.5 JSON files
 
