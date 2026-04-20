@@ -562,11 +562,13 @@ Additionally, Telegram metadata (sender name from `from.first_name`) is used to 
 
 | Command | Effect |
 |---|---|
-| `status` | Returns effective hunger state (`HS0/HS1/HS2/HS3`), subscriber count, queue size, thread health |
-| `set_hs HS1\|HS2\|HS3` | Manual override of effective hunger state (bypasses stale protection) |
+| `status` | Returns effective hunger state (`HS1/HS2/HS3` or empty when unavailable), raw state, source (`port/rpc/none`), stale flag, subscriber count, queue size, thread health |
+| `help` | Returns supported RPC commands |
+| `set_hs HS1\|HS2\|HS3` | Sets hunger state source to RPC and forces effective hunger to that value |
+| `clear_hs` | Clears hunger state (`source=none`, effective hunger becomes empty) |
 | `reload_prompts` | Reload `prompts.json` without restart |
 
-**Stale hunger protection:** if no hunger update arrives for 60 s and no manual override is active, effective state falls back to HS0 (hunger drive unavailable) to prevent stale hunger behavior.
+**Stale hunger protection:** if hunger source is `port` and no update arrives for 60 s, effective hunger becomes empty (no hunger overlay), not `HS0`.
 
 ---
 
@@ -586,7 +588,7 @@ Central prompt file loaded by both `executiveControl` and `chatBot` at startup, 
 **`chat_bot` section:**
 - `base_system_prompt`
 - `base_system_prompt` now further biases toward natural rhythm, reduced repetition, and context-specific emotional responses
-- `hs_overlays.HS0`, `hs_overlays.HS1`, `hs_overlays.HS2`, `hs_overlays.HS3` — layered on top of base
+- `hs_overlays.HS1`, `hs_overlays.HS2`, `hs_overlays.HS3` — layered on top of base
 - `hs3_override_system` — strict starvation override injected at the top of the message list
 - `hs2_force_hunger_system` — forced hunger comment directive
 - `hs3_broadcast_system`, `hs3_broadcast_user` — LLM prompts for HS3 broadcasts
@@ -637,9 +639,10 @@ level < 25%           → HS3  (starving)
 ### 4.3 Chatbot effective hunger
 
 ```text
-hunger stream fresh and no override  → use raw hunger state from stream
-hunger stale (> 60 s) and no override → force effective state to HS0
-manual override active               → use overridden state regardless of staleness
+source = rpc                          → use RPC hunger state (HS1/HS2/HS3)
+source = port and fresh (<= 60 s)     → use streamed hunger state (HS1/HS2/HS3)
+source = port and stale (> 60 s)      → effective hunger = empty
+source = none                         → effective hunger = empty
 ```
 
 ---
@@ -709,9 +712,9 @@ any internal queue full (DB / IO / Telegram)
 ### 5.6 Stale hunger (chatBot)
 
 ```text
-no fresh hunger update for 60 s (and no manual override)
-  → effective hunger forced to HS0
-  → hunger-drive overlay is disabled until hunger stream becomes fresh again
+no fresh hunger update for 60 s while source=port
+  → effective hunger becomes empty
+  → hunger-drive overlay is disabled until a fresh port update or RPC set_hs arrives
 ```
 
 ### 5.7 LLM unavailability
@@ -769,7 +772,9 @@ yarp connect /alwayson/stm/context:o /alwayson/salienceNetwork/context:i
 | `executiveControl` | `hunger_mode <on\|off>` | Enable/disable hunger logic globally (resets level to 100%) |
 | `executiveControl` | `status`, `ping`, `help`, `quit` | Module control |
 | `chatBot` | `status` | Returns hunger state, subscriber count, and thread health |
+| `chatBot` | `help` | Returns available chatbot RPC commands |
 | `chatBot` | `set_hs HS1\|HS2\|HS3` | Override effective hunger persona |
+| `chatBot` | `clear_hs` | Clear hunger source/state so effective hunger is empty |
 | `chatBot` | `reload_prompts` | Reload prompts.json without restart |
 
 ---
@@ -870,7 +875,7 @@ executiveControl.py
   - DB worker thread (SQLite inserts)
 
 chatBot.py
-  - main loop (hunger read + update drain + HS3 broadcast)
+  - main loop (hunger read + update drain + HS3 broadcast + HS3-exit recovery broadcast)
   - Telegram polling thread (long-poll + update queue)
 ```
 
@@ -893,7 +898,7 @@ chatBot.py
 
 - Proactive and responsive execution paths are mutually exclusive — responsive events are dropped (not deferred) while a proactive interaction runs.
 - `salienceNetwork` starts and runs without STM context connected — the context port is optional and can be connected at any time.
-- `chatBot` remains resilient if `executiveControl` disconnects — stale hunger falls back to HS0 after 60 s.
+- `chatBot` remains resilient if `executiveControl` disconnects — stale hunger becomes empty after 60 s (hunger overlay disabled until fresh input or RPC set).
 - `executiveControl` can run with hunger mode OFF — interactions proceed as hunger-neutral (`HS1`/100%), and QR feeding events are ignored.
 - All LLM calls have fallback strings — no interaction or Telegram reply ever blocks indefinitely on LLM availability.
 - All file I/O and DB writes are off the main loop — latency spikes in storage never stall perception or interaction.
