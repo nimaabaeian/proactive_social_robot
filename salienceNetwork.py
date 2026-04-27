@@ -2,20 +2,20 @@
 
 import fcntl
 import json
+import math
 import os
 import queue
 import signal
 import sqlite3
-from dataclasses import asdict, dataclass
 import sys
 import tempfile
 import threading
 import time
 import uuid
+from dataclasses import asdict, dataclass
 from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-import math
 from zoneinfo import ZoneInfo
 
 try:
@@ -24,7 +24,8 @@ except ImportError:
     print("[ERROR] YARP Python bindings required.")
     sys.exit(1)
 
-
+_MODULE_DIR   = os.path.dirname(os.path.abspath(__file__))
+_ALWAYSON_DIR = os.path.dirname(_MODULE_DIR)
 
 
 class SalienceNetworkModule(yarp.RFModule):
@@ -129,18 +130,10 @@ class SalienceNetworkModule(yarp.RFModule):
 
         self.executive_control_rpc_name = "/executiveControl"
 
-        self.learning_path = Path(
-            "/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/learning.json"
-        )
-        self.greeted_path = Path(
-            "/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/greeted_today.json"
-        )
-        self.talked_path = Path(
-            "/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/talked_today.json"
-        )
-        self.last_greeted_path = Path(
-            "/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/last_greeted.json"
-        )
+        self.learning_path     = Path(_ALWAYSON_DIR) / "memory" / "learning.json"
+        self.greeted_path      = Path(_ALWAYSON_DIR) / "memory" / "greeted_today.json"
+        self.talked_path       = Path(_ALWAYSON_DIR) / "memory" / "talked_today.json"
+        self.last_greeted_path = Path(_ALWAYSON_DIR) / "memory" / "last_greeted.json"
 
         # YARP ports
         self.landmarks_port: Optional[yarp.BufferedPortBottle] = None
@@ -220,7 +213,7 @@ class SalienceNetworkModule(yarp.RFModule):
         self._io_queue: queue.Queue = queue.Queue(maxsize=self.IO_QUEUE_MAXSIZE)
         self._io_thread: Optional[threading.Thread] = None
 
-        self.db_path = "/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/data_collection/salience_network.db"
+        self.db_path = str(Path(_ALWAYSON_DIR) / "data_collection" / "salience_network.db")
         self._db_queue: queue.Queue = queue.Queue(maxsize=self.DB_QUEUE_MAXSIZE)
         self._db_thread: Optional[threading.Thread] = None
         self._context_connected_logged = False
@@ -1759,40 +1752,30 @@ class SalienceNetworkModule(yarp.RFModule):
 
     # ==================== JSON File Management ====================
 
-    def _load_all_json_files(self):
+    def _load_memory_from_disk(self, log_prefix: str) -> None:
+        """Read memory JSON files from disk and prune greeted/talked to today."""
         with self._memory_lock:
-            self.greeted_today = self._load_json(self.greeted_path, {})
-            self.talked_today = self._load_json(self.talked_path, {})
+            self.greeted_today = self._prune_to_today(
+                self._load_json(self.greeted_path, {})
+            )
+            self.talked_today = self._prune_to_today(
+                self._load_json(self.talked_path, {})
+            )
             learning_raw = self._load_json(self.learning_path, {"people": {}})
             self.learning_data = learning_raw.get("people", {})
-
-            self.greeted_today = self._prune_to_today(self.greeted_today)
-            self.talked_today = self._prune_to_today(self.talked_today)
         self._log(
             "INFO",
-            f"Loaded – greeted:{len(self.greeted_today)} "
+            f"{log_prefix} – greeted:{len(self.greeted_today)} "
             f"talked:{len(self.talked_today)} "
             f"learning:{len(self.learning_data)}",
         )
+
+    def _load_all_json_files(self):
+        self._load_memory_from_disk("Loaded")
 
     def _reload_memory_from_disk_and_prune_today(self):
-        """Re-read memory JSON files from disk and prune greeted/talked to today.
-        Called on day-change to pick up any writes that happened outside this process.
-        """
-        with self._memory_lock:
-            self.greeted_today = self._load_json(self.greeted_path, {})
-            self.talked_today = self._load_json(self.talked_path, {})
-            learning_raw = self._load_json(self.learning_path, {"people": {}})
-            self.learning_data = learning_raw.get("people", {})
-
-            self.greeted_today = self._prune_to_today(self.greeted_today)
-            self.talked_today = self._prune_to_today(self.talked_today)
-        self._log(
-            "INFO",
-            f"Day-change reload – greeted:{len(self.greeted_today)} "
-            f"talked:{len(self.talked_today)} "
-            f"learning:{len(self.learning_data)}",
-        )
+        """Re-read memory on day-change to pick up out-of-process writes."""
+        self._load_memory_from_disk("Day-change reload")
 
     def _load_json(self, path: Path, default: Any) -> Any:
         try:
